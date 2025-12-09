@@ -1,0 +1,2 @@
+# Rblx-ECS
+rblx-ecs is a Roblox-TS library that works with the Entity Component System (ECS) architecture to help you create entities, read component data, and iterate through millions of entities with an optimal balance between fast iteration performance and fast random memory access performance.
