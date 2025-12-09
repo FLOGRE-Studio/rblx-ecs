@@ -24,5 +24,8 @@
     "@rbxts/types": "^1.0.896",
     "roblox-ts": "^3.0.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@rbxts/rblx-object-utils": "^1.0.3"
   }
 }
