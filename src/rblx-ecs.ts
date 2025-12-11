@@ -268,7 +268,7 @@ export namespace RblxECS {
          */
         export function get<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>): Readonly<T> | undefined {
             const [ entityId, _ ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to get a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
             
             // Look up the component entry for the provided type.
             const componentEntry = components[component];
