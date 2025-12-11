@@ -1,43 +1,17 @@
 import { StrictComponent, ComponentType, ComponentsDenseArray, CallbackWithSelectedStrictComponentsArguments, NewStrictComponentsTupleReturnType, EntityToComponentsSparseArray, ComponentToEntityDenseArray } from "./types/component";
-import { EntityHandle, EntityId } from "./types/entity";
+import { EntityHandle } from "./types/entity";
 import { RblxLogger } from "./utils/logger";
 import { isEntityValid } from "./utils/isEntityValid";
 
 /**
- * RblxECS - A high-performance Entity Component System (ECS) implementation for Roblox.
- * 
- * This namespace provides a complete ECS framework designed for efficient game object management
- * through data-oriented design patterns. It uses dense arrays for cache-friendly component storage
- * and sparse maps for fast entity-to-component lookups.
- * 
- * ## Architecture Overview
- * 
- * ### Entity Management
- * - Entities are identified by numeric IDs with generation counters to detect stale references
- * - Supports entity recycling through a free list to maintain stable ID allocation
- * - Generation increments prevent invalid access to reused entity IDs
- * 
- * ### Component Storage
- * - Uses a hybrid dense-sparse storage model for optimal performance
- * - **Dense Arrays**: Store actual component data contiguously for cache efficiency
- * - **Sparse Maps**: Map entity IDs to component indices for O(1) lookup
- * - Swap-and-pop removal maintains dense array structure without fragmentation
- * 
- * ### Event System
- * - Bitmask-based component change notifications for efficient event subscription
- * - Supports batch component updates with automatic change signal propagation
- * - Callbacks are invoked only for entities matching the subscribed component mask
- * 
- * ## Core Concepts
- * 
- * **EntityHandle**: A tuple [entityId, generation] that uniquely identifies an entity across its lifetime.
- * Provides validation to prevent operations on destroyed or recycled entities.
- * 
- * **StrictComponent**: A branded numeric type representing a registered component type identifier.
- * Used for type-safe component storage and retrieval with full TypeScript inference.
- * 
- * **Component Mask**: A bitmask where each bit represents a component type. Used for efficient
- * event subscription and filtering without allocating intermediate collections.
+ * RblxECS
+ *
+ * Compact Entity Component System core for Roblox-TS projects.
+ *
+ * Concepts:
+ * - Entities are represented as `[entityId, generation]` handles. Generations detect stale handles.
+ * - Components are stored in dense arrays for fast iteration and mapped with sparse arrays for O(1) lookup.
+ * - Event subscriptions use a bitmask per component-set to efficiently dispatch batched change notifications.
  */
 export namespace RblxECS {
     /**
@@ -50,7 +24,7 @@ export namespace RblxECS {
      * Array of all currently active entity IDs.
      * Includes both newly created and recycled entities that haven't been destroyed.
      */
-    const entities           : EntityId[] = [];
+    const entities           : number[] = [];
 
     /**
      * Parallel array to entity IDs storing generation counters.
@@ -108,7 +82,7 @@ export namespace RblxECS {
          */
         export function setIsDebugMode(value: boolean) {
             // Set debug mode for logging.
-            RblxLogger.Configuration.inDebugMode = true;
+            RblxLogger.Configuration.inDebugMode = value;
         }
     }
 
@@ -209,34 +183,16 @@ export namespace RblxECS {
                 return false;
             }
 
-            for (let componentType = 0; componentType < components.size() - 1; componentType++) {
+            for (let componentType = 0; componentType < components.size(); componentType++) {
                 const componentBucket = components[componentType];
+
                 if (componentBucket === undefined) {
                     RblxLogger.errorOutput("RblxECS.destroyEntity", `either componentsDenseArray or entityToComponentsSparseArray is undefined.`);
                     continue;
                 }
 
-                const [componentsDenseArray, entityToComponentsSparseArray, componentToEntityDenseArray] = componentBucket;
-            
-                const componentIndex = entityToComponentsSparseArray[entityId];
+                RblxECS.Component.remove(entityHandle, componentType);
 
-                if (componentIndex !== undefined) {
-                    const lastDenseArrayIndexComponent       = componentsDenseArray.size() - 1;
-                    const lastSparseArrayEntityToComponent   = entityToComponentsSparseArray.size() - 1;
-                    const lastDenseArrayComponentToEntity    = componentToEntityDenseArray.size() - 1;
-
-                    if (componentIndex !== lastDenseArrayIndexComponent) {
-                        [componentsDenseArray[componentIndex], componentsDenseArray[lastDenseArrayIndexComponent]] = [componentsDenseArray[lastDenseArrayIndexComponent], componentsDenseArray[componentIndex]]
-                    }
-
-                    if (entityId !== lastSparseArrayEntityToComponent) {
-                        [entityToComponentsSparseArray[entityId], entityToComponentsSparseArray[lastSparseArrayEntityToComponent]] = [entityToComponentsSparseArray[lastSparseArrayEntityToComponent], entityToComponentsSparseArray[entityId]];
-                    }
-
-                    componentsDenseArray.pop();
-                    entityToComponentsSparseArray.pop();
-                    delete componentToEntityDenseArray[lastDenseArrayComponentToEntity];
-                }
             }
 
             const generationIncremented = generation + 1;
@@ -304,14 +260,14 @@ export namespace RblxECS {
          * 
          * @example
          * ```typescript
-         * const position = RblxECS.Component.getComponent(entity, Position);
+         * const position = RblxECS.Component.get(entity, Position);
          * if (position) {
          *   console.log(`Entity at ${position.x}, ${position.y}, ${position.z}`);
          * }
          * ```
          */
-        export function getComponent<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>): T | undefined {
-            const [ entityId, generation ] = entityHandle;
+        export function get<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>): Readonly<T> | undefined {
+            const [ entityId, _ ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
             
             // Look up the component entry for the provided type.
@@ -361,42 +317,41 @@ export namespace RblxECS {
          * @example
          * ```typescript
          * const positionData = { x: 10, y: 20, z: 30 };
-         * RblxECS.Component.addComponent(entity, Position, positionData);
+         * RblxECS.Component.add(entity, Position, positionData);
          * ```
          */
-        export function addComponent<T extends object>(entityHandle: EntityHandle, componentType: StrictComponent<T>, strictComponent: T): void {
+        export function add<T extends object>(entityHandle: EntityHandle, componentType: StrictComponent<T>, strictComponent: T): void {
             const [ entityId, generation ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
 
             const componentEntry = components[componentType];
 
             if (componentEntry === undefined) {
-                const componentsDenseArray           = new Array<object>();
-                const entityToComponentsSparseArray  = new Array<number>();
-                const denseComponentsToEntityArray   = new Array<number>();
+                const denseArraycomponents           = new Array<object>();
+                const sparseArrayEntityToComponents  = new Array<number>();
+                const denseArrayComponentsToEntity   = new Array<number>();
 
                 // Store the component data in the dense array.
-                componentsDenseArray.push(strictComponent);
-                const newLastIndex = componentsDenseArray.size() - 1;
+                denseArraycomponents.push(strictComponent);
+                const newLastIndex = denseArraycomponents.size() - 1;
 
-                entityToComponentsSparseArray[entityId]      = newLastIndex;
-                denseComponentsToEntityArray[newLastIndex]   = entityId;
+                sparseArrayEntityToComponents[entityId]      = newLastIndex;
+                denseArrayComponentsToEntity[newLastIndex]   = entityId;
                 
                 // Update the mapping for this component type.
-                components[componentType] = [componentsDenseArray, entityToComponentsSparseArray, denseComponentsToEntityArray];
+                components[componentType] = [denseArraycomponents, sparseArrayEntityToComponents, denseArrayComponentsToEntity];
             } else {
-                const [componentsDenseArray, entityToComponentsSparseArray, denseComponentsToEntityArray] = components[componentType];
-                print(entityToComponentsSparseArray);
-                
-                const index = entityToComponentsSparseArray[entityId];
+                const [denseArraycomponents, sparseArrayEntityToComponents, denseArrayComponentsToEntity] = components[componentType];
+                                
+                const index = sparseArrayEntityToComponents[entityId];
                 if (index !== undefined) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the same component with the same type has already been added to it.`);
 
                 // Store the component data in the dense array.
-                componentsDenseArray.push(strictComponent);
-                const lastIndex = componentsDenseArray.size() - 1;
+                denseArraycomponents.push(strictComponent);
+                const lastIndex = denseArraycomponents.size() - 1;
 
-                entityToComponentsSparseArray[entityId] = lastIndex;
-                denseComponentsToEntityArray[lastIndex] = entityId;
+                sparseArrayEntityToComponents[entityId] = lastIndex;
+                denseArrayComponentsToEntity[lastIndex] = entityId;
             }
         }
 
@@ -425,11 +380,11 @@ export namespace RblxECS {
          * 
          * @example
          * ```typescript
-         * const removed = RblxECS.Component.removeComponent(entity, Position);
+         * const removed = RblxECS.Component.remove(entity, Position);
          * console.log(removed ? "Component removed" : "Entity didn't have that component");
          * ```
          */
-        export function removeComponent(entityHandle: EntityHandle, componentType: ComponentType): boolean {
+        export function remove(entityHandle: EntityHandle, componentType: ComponentType): boolean {
             const [ entityId ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to remove a component from stale entity handle ${entityId}.`);
 
@@ -445,13 +400,13 @@ export namespace RblxECS {
             const lastIndexOfSpraseArrayEntityToSwap = sparseArrayEntityToComponents.size() - 1;
 
             if (indexOfComponentToRemove !== lastIndexOfDenseArrayComponentToSwap) {
+                const entityIdToBeSwapped = denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap];
+            
                 // Component to remove swapped at its current index position with another component at the last index position.
                 [denseArrayComponents[indexOfComponentToRemove], denseArrayComponents[lastIndexOfDenseArrayComponentToSwap]] =
                 [denseArrayComponents[lastIndexOfDenseArrayComponentToSwap], denseArrayComponents[indexOfComponentToRemove]];
 
-                // Entity (THIS entity) for the component to remove swapped at its current index position with another entity of that component at the last index position.
-                [sparseArrayEntityToComponents[entityId], sparseArrayEntityToComponents[lastIndexOfSpraseArrayEntityToSwap]] = 
-                [sparseArrayEntityToComponents[lastIndexOfSpraseArrayEntityToSwap], sparseArrayEntityToComponents[entityId]];
+                sparseArrayEntityToComponents[entityIdToBeSwapped] = indexOfComponentToRemove;
 
                 // Component to remove for entity (THIS entity) swapped at its current index position with another component for another entity at the last index position.
                 [denseArrayComponentToEntity[indexOfComponentToRemove], denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap]] =
@@ -460,97 +415,10 @@ export namespace RblxECS {
 
             // Remove the last element
             denseArrayComponents.pop();
-            sparseArrayEntityToComponents.pop();
-            print(sparseArrayEntityToComponents);
+            delete sparseArrayEntityToComponents[entityId];
             denseArrayComponentToEntity.pop();
 
             return true;
-        }
-
-
-        /**
-         * Atomically retrieves and modifies multiple components on an entity.
-         * 
-         * Fetches the selected components, passes them to a callback for modification,
-         * and applies the changes atomically. Triggers change callbacks for all modified components
-         * with a single combined bitmask, providing efficient batch notifications.
-         * 
-         * ## Batch Processing
-         * 1. Validates the entity handle
-         * 2. Retrieves all selected component instances (or undefined if not attached)
-         * 3. Passes them to the callback for processing
-         * 4. Applies returned changes to the entity
-         * 5. Fires combined change notification for efficiency
-         * 
-         * ## Change Notifications
-         * Listeners subscribed to any subset of the modified components will receive
-         * a single consolidated callback rather than separate notifications.
-         * 
-         * @template T - Tuple of StrictComponent types to operate on
-         * @param {EntityHandle} entityHandle - The entity to modify
-         * @param {Function} callback - Function receiving components and returning modifications
-         * @param {...StrictComponent[]} componentsSelect - Component types to include in the batch
-         * @returns {void}
-         * 
-         * @throws {Error} If the entity handle is stale or invalid
-         * 
-         * @example
-         * ```typescript
-         * RblxECS.Component.batchComponentsChange(
-         *   entity,
-         *   (pos, vel) => [
-         *     RblxECS.Component.returnNewComponent(Position, { 
-         *       x: (pos?.x ?? 0) + (vel?.x ?? 0),
-         *       y: (pos?.y ?? 0) + (vel?.y ?? 0),
-         *       z: (pos?.z ?? 0) + (vel?.z ?? 0)
-         *     }),
-         *   ],
-         *   Position,
-         *   Velocity
-         * );
-         * ```
-         */
-        export function batchComponentsChange<T extends StrictComponent<unknown>[]>(
-            entityHandle: EntityHandle,
-            callback: (...args: { [K in keyof T]: T[K] extends StrictComponent<infer X> ? (X | undefined) : never }) => NewStrictComponentsTupleReturnType<T>,
-            ...componentsSelect: [...T]
-        ) {
-            const [ entityId, generation ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot batch components change on the entity with the ID of ${entityId} because the entity itself is stale and outdated.`);
-
-            let mask = 0;
-
-            const selectedComponents = componentsSelect.map((componentNumericId, i) => {
-                const [ComponentsDenseArray, EntityToComponentsSparseArray] = components[componentNumericId];
-                if (ComponentsDenseArray === undefined || EntityToComponentsSparseArray === undefined) return undefined;
-
-                const index = EntityToComponentsSparseArray[entityId];
-                if (index === undefined) return undefined;
-
-                return ComponentsDenseArray[index];
-            }) as { [K in keyof T]: T[K] extends StrictComponent<infer X> ? X | undefined : never };
-
-            const batchedComponentsResult = callback(...selectedComponents);
-            const changedComponents: object[] = [];
-
-            for (const [componentNumericId, componentData] of batchedComponentsResult) {
-                const [ComponentsDenseArray, EntityToComponentsSparseArray] = components[componentNumericId];
-                if (ComponentsDenseArray === undefined || EntityToComponentsSparseArray === undefined) return undefined;
-
-                const index = EntityToComponentsSparseArray[entityId];
-                if (index === undefined) continue;
-
-                mask |= (1 << componentNumericId);
-                ComponentsDenseArray[index] = componentData as object;
-                changedComponents.push(componentData as object);
-            }
-
-            const callbacksArray = componentsChangedSignalCallbacks[mask];
-            if (callbacksArray === undefined) return;
-
-            for (const callback of callbacksArray) {
-                callback(...changedComponents as [...T])
-            }
         }
 
         /**
