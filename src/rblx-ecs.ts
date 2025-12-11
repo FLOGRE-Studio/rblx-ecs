@@ -1,5 +1,4 @@
-import RblxObject from "@rbxts/rblx-object-utils";
-import { StrictComponent, ComponentType, DenseComponentsArray, SparseEntityToComponentsMap, CallbackWithSelectedStrictComponentsArguments, CallbackWithSelectedStrictComponentsArgumentsAndReturnType, NewStrictComponentsTupleReturnType } from "./types/component";
+import { StrictComponent, ComponentType, ComponentsDenseArray, CallbackWithSelectedStrictComponentsArguments, NewStrictComponentsTupleReturnType, EntityToComponentsSparseArray, ComponentToEntityDenseArray } from "./types/component";
 import { EntityHandle, EntityId } from "./types/entity";
 import { RblxLogger } from "./utils/logger";
 import { isEntityValid } from "./utils/isEntityValid";
@@ -43,7 +42,7 @@ import { isEntityValid } from "./utils/isEntityValid";
 export namespace RblxECS {
     /**
      * The next unique entity ID to be allocated.
-     * Incremented when creating new entities; reused IDs come from freeIdsArray instead.
+     * Incremented when creating new entities; reused IDs come from freeEntityIdsArray instead.
      */
     let nextEntityId         : number     = 0;
 
@@ -65,7 +64,7 @@ export namespace RblxECS {
      * When an entity is destroyed, its ID is returned here instead of being discarded,
      * reducing allocation pressure and maintaining stable ID ranges.
      */
-    const freeIdsArray       : number[]   = [];
+    const freeEntityIdsArray       : number[]   = [];
 
     /**
      * Maps component change bitmasks to their associated callback functions.
@@ -74,21 +73,18 @@ export namespace RblxECS {
      * 
      * Structure: Map<bitmask, [callback1, callback2, ...]>
      */
-    const componentsChangedSignalCallbacks: Map<number, ((...args: number[]) => void)[]> = new Map();
+    const componentsChangedSignalCallbacks: Array<Array<((...args: number[]) => void)>> = new Array();
 
     /**
      * Central registry of all component types and their storage structures.
      * 
      * For each registered component type, stores:
-     * 1. DenseComponentsArray: Contiguous array of component instances for cache efficiency
+     * 1. ComponentsDenseArray: Contiguous array of component instances for cache efficiency
      * 2. SparseEntityToComponentsMap: Maps entity IDs to indices in the dense array
      * 
      * This hybrid structure provides O(1) lookups and O(1) removal while maintaining cache locality.
      */
-    const components: Map<
-        ComponentType,
-        [DenseComponentsArray<object>, SparseEntityToComponentsMap]
-    > = new Map();
+    export const components: [ComponentsDenseArray<object>, EntityToComponentsSparseArray, ComponentToEntityDenseArray][] = [];
 
     /**
      * Debug utilities for the ECS system.
@@ -152,29 +148,29 @@ export namespace RblxECS {
          */
         export function createEntity(): EntityHandle {
             // Check if any previously freed entity IDs are available for reuse
-            if (freeIdsArray.size() > 0) {
+            if (freeEntityIdsArray.size() > 0) {
                 // Recycle an ID from the free list
-                const id = freeIdsArray.pop()!;
+                const entityId = freeEntityIdsArray.pop()!;
 
                 // Increment the generation for this reused entity ID
-                const generationIncremented = (generationsArray[id] ?? -1) + 1; 
-                generationsArray[id] = generationIncremented;
+                const generationIncremented = (generationsArray[entityId] ?? -1) + 1; 
+                generationsArray[entityId] = generationIncremented;
 
                 // Return the recycled entity's ID and updated generation
-                return [id, generationIncremented];
+                return [entityId, generationIncremented];
             } else {
                 // No reusable IDs; allocate a new entity ID
-                const id = nextEntityId++;
+                const entityId = nextEntityId++;
 
                 // Initialize the generation for this new entity ID
-                const generationIncremented = (generationsArray[id] ?? -1) + 1; 
-                generationsArray[id] = generationIncremented;
+                const generationIncremented = (generationsArray[entityId] ?? -1) + 1; 
+                generationsArray[entityId] = generationIncremented;
 
                 // Register the new entity in the global entity list
-                entities.push(id);
+                entities.push(entityId);
 
                 // Return the new entity's ID and its initial generation
-                return [id, generationIncremented];
+                return [entityId, generationIncremented];
             }
         }
         
@@ -213,27 +209,39 @@ export namespace RblxECS {
                 return false;
             }
 
-            for (const [componentType, componentEntry] of components) {
-                const [denseComponentsArray, sparseEntityToComponentsMap] = componentEntry;
+            for (let componentType = 0; componentType < components.size() - 1; componentType++) {
+                const componentBucket = components[componentType];
+                if (componentBucket === undefined) {
+                    RblxLogger.errorOutput("RblxECS.destroyEntity", `either componentsDenseArray or entityToComponentsSparseArray is undefined.`);
+                    continue;
+                }
 
-                const componentIndex = sparseEntityToComponentsMap.get(entityId);
+                const [componentsDenseArray, entityToComponentsSparseArray, componentToEntityDenseArray] = componentBucket;
+            
+                const componentIndex = entityToComponentsSparseArray[entityId];
 
                 if (componentIndex !== undefined) {
-                    const lastArrayIndexDenseComponent = denseComponentsArray.size() - 1;
+                    const lastDenseArrayIndexComponent       = componentsDenseArray.size() - 1;
+                    const lastSparseArrayEntityToComponent   = entityToComponentsSparseArray.size() - 1;
+                    const lastDenseArrayComponentToEntity    = componentToEntityDenseArray.size() - 1;
 
-                    if (componentIndex !== lastArrayIndexDenseComponent) {
-                        denseComponentsArray[componentIndex] = denseComponentsArray[lastArrayIndexDenseComponent];
-                        [denseComponentsArray[componentIndex], denseComponentsArray[lastArrayIndexDenseComponent]] = [denseComponentsArray[lastArrayIndexDenseComponent],denseComponentsArray[componentIndex]]
+                    if (componentIndex !== lastDenseArrayIndexComponent) {
+                        [componentsDenseArray[componentIndex], componentsDenseArray[lastDenseArrayIndexComponent]] = [componentsDenseArray[lastDenseArrayIndexComponent], componentsDenseArray[componentIndex]]
                     }
 
-                    denseComponentsArray.pop();
-                    sparseEntityToComponentsMap.delete(entityId);
+                    if (entityId !== lastSparseArrayEntityToComponent) {
+                        [entityToComponentsSparseArray[entityId], entityToComponentsSparseArray[lastSparseArrayEntityToComponent]] = [entityToComponentsSparseArray[lastSparseArrayEntityToComponent], entityToComponentsSparseArray[entityId]];
+                    }
+
+                    componentsDenseArray.pop();
+                    entityToComponentsSparseArray.pop();
+                    delete componentToEntityDenseArray[lastDenseArrayComponentToEntity];
                 }
             }
 
             const generationIncremented = generation + 1;
 
-            freeIdsArray.push(entityId);
+            freeEntityIdsArray.push(entityId);
             generationsArray[entityId] = generationIncremented;
         }
     }
@@ -307,23 +315,25 @@ export namespace RblxECS {
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
             
             // Look up the component entry for the provided type.
-            const componentEntry = components.get(component);
+            const componentEntry = components[component];
 
             if (componentEntry === undefined) {
+                RblxLogger.errorOutput("RblxECS.destroyEntity", `either ComponentsDenseArray or EntityToComponentsSparseArray is undefined.`);
                 return undefined;
             }
 
-            const [denseComponentsArray, sparseEntityToComponentsMap] = componentEntry;
+            const [ComponentsDenseArray, EntityToComponentsSparseArray] = componentEntry;
+
 
             // Find the index of the component for this entity.
-            const componentIndex = sparseEntityToComponentsMap.get(entityId);
+            const componentIndex = EntityToComponentsSparseArray[entityId];
             
             if (componentIndex === undefined) {
                 return undefined;
             }
 
             // Return the component instance from the dense array.
-            return denseComponentsArray[componentIndex] as T;
+            return ComponentsDenseArray[componentIndex] as T;
         }
 
         /**
@@ -358,21 +368,36 @@ export namespace RblxECS {
             const [ entityId, generation ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
 
-            // Retrieve or initialize component storage structures.
-            let denseComponentsArray: Array<object>;
-            let sparseEntityToComponentsMap: Map<EntityId, number> = new Map();
+            const componentEntry = components[componentType];
 
-            const componentsEntryIndexed = components.get(componentType);
+            if (componentEntry === undefined) {
+                const componentsDenseArray           = new Array<object>();
+                const entityToComponentsSparseArray  = new Array<number>();
+                const denseComponentsToEntityArray   = new Array<number>();
 
-            denseComponentsArray         = componentsEntryIndexed ? componentsEntryIndexed[0] : new Array();
-            sparseEntityToComponentsMap  = componentsEntryIndexed ? componentsEntryIndexed[1] : new Map();
+                // Store the component data in the dense array.
+                componentsDenseArray.push(strictComponent);
+                const newLastIndex = componentsDenseArray.size() - 1;
 
-            // Store the component data in the dense array.
-            denseComponentsArray.push(strictComponent as object);
-            sparseEntityToComponentsMap.set(entityId, denseComponentsArray.size() - 1);
+                entityToComponentsSparseArray[entityId]      = newLastIndex;
+                denseComponentsToEntityArray[newLastIndex]   = entityId;
+                
+                // Update the mapping for this component type.
+                components[componentType] = [componentsDenseArray, entityToComponentsSparseArray, denseComponentsToEntityArray];
+            } else {
+                const [componentsDenseArray, entityToComponentsSparseArray, denseComponentsToEntityArray] = components[componentType];
+                print(entityToComponentsSparseArray);
+                
+                const index = entityToComponentsSparseArray[entityId];
+                if (index !== undefined) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the same component with the same type has already been added to it.`);
 
-            // Update the mapping for this component type.
-            components.set(componentType, [denseComponentsArray, sparseEntityToComponentsMap]);
+                // Store the component data in the dense array.
+                componentsDenseArray.push(strictComponent);
+                const lastIndex = componentsDenseArray.size() - 1;
+
+                entityToComponentsSparseArray[entityId] = lastIndex;
+                denseComponentsToEntityArray[lastIndex] = entityId;
+            }
         }
 
         /**
@@ -405,48 +430,43 @@ export namespace RblxECS {
          * ```
          */
         export function removeComponent(entityHandle: EntityHandle, componentType: ComponentType): boolean {
-            const [ entityId, generation ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
+            const [ entityId ] = entityHandle;
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to remove a component from stale entity handle ${entityId}.`);
 
-            // Look up the component entry.
-            const componentEntry = components.get(componentType);
+            const componentEntry = components[componentType];
+            if (componentEntry === undefined) return false;
 
-            if (!componentEntry) {
-                return false;
+            const [denseArrayComponents, sparseArrayEntityToComponents, denseArrayComponentToEntity] = componentEntry;
+
+            const indexOfComponentToRemove = sparseArrayEntityToComponents[entityId];
+            if (indexOfComponentToRemove === undefined) return false;
+
+            const lastIndexOfDenseArrayComponentToSwap = denseArrayComponents.size() - 1;
+            const lastIndexOfSpraseArrayEntityToSwap = sparseArrayEntityToComponents.size() - 1;
+
+            if (indexOfComponentToRemove !== lastIndexOfDenseArrayComponentToSwap) {
+                // Component to remove swapped at its current index position with another component at the last index position.
+                [denseArrayComponents[indexOfComponentToRemove], denseArrayComponents[lastIndexOfDenseArrayComponentToSwap]] =
+                [denseArrayComponents[lastIndexOfDenseArrayComponentToSwap], denseArrayComponents[indexOfComponentToRemove]];
+
+                // Entity (THIS entity) for the component to remove swapped at its current index position with another entity of that component at the last index position.
+                [sparseArrayEntityToComponents[entityId], sparseArrayEntityToComponents[lastIndexOfSpraseArrayEntityToSwap]] = 
+                [sparseArrayEntityToComponents[lastIndexOfSpraseArrayEntityToSwap], sparseArrayEntityToComponents[entityId]];
+
+                // Component to remove for entity (THIS entity) swapped at its current index position with another component for another entity at the last index position.
+                [denseArrayComponentToEntity[indexOfComponentToRemove], denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap]] =
+                [denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap], denseArrayComponentToEntity[indexOfComponentToRemove]]
             }
 
-            const [denseComponentsArray, sparseEntityToComponentsMap] = componentEntry;
+            // Remove the last element
+            denseArrayComponents.pop();
+            sparseArrayEntityToComponents.pop();
+            print(sparseArrayEntityToComponents);
+            denseArrayComponentToEntity.pop();
 
-            // Find the index for this entity's component.
-            const componentIndex = sparseEntityToComponentsMap.get(entityId);
-            if (componentIndex === undefined) {
-                return false;
-            }
-
-            // Remove the component data from the dense array
-            // Swap with the last element and pop to keep array dense
-            const lastIdx = denseComponentsArray.size();
-
-            if (componentIndex !== lastIdx) {
-                // Swap the element to remove with the last one
-                denseComponentsArray[componentIndex] = denseComponentsArray[lastIdx];
-
-                // Find which entity owns the last component and update its mapping
-                const swappedEntityId = [...RblxObject.entries(sparseEntityToComponentsMap)]
-                    .find(([_, idx]) => idx === lastIdx)?.[0];
-                if (swappedEntityId !== undefined) {
-                    sparseEntityToComponentsMap.set(swappedEntityId, componentIndex);
-                }
-            }
-            
-            // Remove the last component
-            denseComponentsArray.pop();
-            // Delete the removed component's mapping.
-            sparseEntityToComponentsMap.delete(entityId);
-
-            // Indicate this a successful removal.
             return true;
         }
+
 
         /**
          * Atomically retrieves and modifies multiple components on an entity.
@@ -501,33 +521,31 @@ export namespace RblxECS {
             let mask = 0;
 
             const selectedComponents = componentsSelect.map((componentNumericId, i) => {
-                const componentEntry = components.get(componentNumericId);
-                if (!componentEntry) return undefined;
+                const [ComponentsDenseArray, EntityToComponentsSparseArray] = components[componentNumericId];
+                if (ComponentsDenseArray === undefined || EntityToComponentsSparseArray === undefined) return undefined;
 
-                const [denseComponentsArray, sparseEntityToComponentsMap] = componentEntry;
-                const index = sparseEntityToComponentsMap.get(entityId);
+                const index = EntityToComponentsSparseArray[entityId];
                 if (index === undefined) return undefined;
 
-                return denseComponentsArray[index];
+                return ComponentsDenseArray[index];
             }) as { [K in keyof T]: T[K] extends StrictComponent<infer X> ? X | undefined : never };
 
             const batchedComponentsResult = callback(...selectedComponents);
             const changedComponents: object[] = [];
 
             for (const [componentNumericId, componentData] of batchedComponentsResult) {
-                const componentEntry = components.get(componentNumericId);
-                if (!componentEntry) continue;
+                const [ComponentsDenseArray, EntityToComponentsSparseArray] = components[componentNumericId];
+                if (ComponentsDenseArray === undefined || EntityToComponentsSparseArray === undefined) return undefined;
 
-                const [denseComponentsArray, sparseEntityToComponentsMap] = componentEntry;
-                const index = sparseEntityToComponentsMap.get(entityId);
+                const index = EntityToComponentsSparseArray[entityId];
                 if (index === undefined) continue;
 
                 mask |= (1 << componentNumericId);
-                denseComponentsArray[index] = componentData as object;
+                ComponentsDenseArray[index] = componentData as object;
                 changedComponents.push(componentData as object);
             }
 
-            const callbacksArray = componentsChangedSignalCallbacks.get(mask);
+            const callbacksArray = componentsChangedSignalCallbacks[mask];
             if (callbacksArray === undefined) return;
 
             for (const callback of callbacksArray) {
@@ -607,11 +625,11 @@ export namespace RblxECS {
             }
 
             // At runtime, selected components are just numeric IDs hence we assert it to ...args: number[].
-            const callbacksArray = componentsChangedSignalCallbacks.get(mask);
+            const callbacksArray = componentsChangedSignalCallbacks[mask];
             if (callbacksArray === undefined) {
                 const newCallbacksArray = new Array<(...args: number[]) => void>();
                 newCallbacksArray.push(callback as (...args: number[]) => void);
-                componentsChangedSignalCallbacks.set(mask, newCallbacksArray);
+                componentsChangedSignalCallbacks[mask] = newCallbacksArray;
                 return;
             }
 
