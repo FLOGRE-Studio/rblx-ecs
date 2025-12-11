@@ -24,10 +24,14 @@ interface Health {
 }
 
 const ECS = {
-    /* At runtime, this is just pure numeric ID.
-     * At compile time, you get good typing information about components.
-    */
-    Health: RblxECS.Component.createStrictComponent<Health>()
+    Tags: { . . . },
+
+    Components: {
+        /* At runtime, this is just pure numeric ID.
+        * At compile time, you get good typing information about components.
+        */
+        Health: RblxECS.Component.createStrictComponent<Health>()
+    }
 }
 
 // Create an entity.
@@ -48,21 +52,25 @@ import { RblxECS } from "rblx-ecs";
 
 // Define tag identifiers using the same API as components, but with an empty object type.
 const ECS = {
-    IsPlayer: RblxECS.Component.createStrictComponent<{}>(), 
-    IsEnemy: RblxECS.Component.createStrictComponent<{}>(),
-    IsAlive: RblxECS.Component.createStrictComponent<{}>(),
+    Tags: {
+        IsPlayer: RblxECS.Tag.createStrictTag(), 
+        IsEnemy: RblxECS.Tag.createStrictTag(),
+        IsAlive: RblxECS.Tag.createStrictTag()
+    },
+
+    Components: { . . . }
 };
 
 const entity = RblxECS.Entity.createEntity();
 
 // Attach a tag by adding a component with empty data.
-RblxECS.Component.addComponent(entity, ECS.IsPlayer, {});
+RblxECS.Tag.add(entity, ECS.Tags.IsPlayer, {});
 
 // Check if an entity has a tag.
-const hasTag = RblxECS.Component.getComponent(entity, ECS.IsPlayer) !== undefined;
+const hasTag = RblxECS.Tag.has(entity, ECS.Tags.IsPlayer);
 
 // Remove a tag.
-RblxECS.Component.removeComponent(entity, ECS.IsPlayer);
+RblxECS.Tag.remove(entity, ECS.Tags.IsPlayer);
 ```
 
 Repository layout
