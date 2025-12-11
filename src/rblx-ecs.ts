@@ -1,4 +1,4 @@
-import { StrictComponent, ComponentType, ComponentsDenseArray, CallbackWithSelectedStrictComponentsArguments, NewStrictComponentsTupleReturnType, EntityToComponentsSparseArray, ComponentToEntityDenseArray } from "./types/component";
+import { StrictComponent, StrictTag } from "./types/component";
 import { EntityHandle } from "./types/entity";
 import { RblxLogger } from "./utils/logger";
 import { isEntityValid } from "./utils/isEntityValid";
@@ -20,6 +20,10 @@ export namespace RblxECS {
      */
     let nextEntityId         : number     = 0;
 
+    let nextComponentId      : number     = 0;
+
+    let nextTagId            : number     = 0;
+
     /**
      * Array of all currently active entity IDs.
      * Includes both newly created and recycled entities that haven't been destroyed.
@@ -38,16 +42,7 @@ export namespace RblxECS {
      * When an entity is destroyed, its ID is returned here instead of being discarded,
      * reducing allocation pressure and maintaining stable ID ranges.
      */
-    const freeEntityIdsArray       : number[]   = [];
-
-    /**
-     * Maps component change bitmasks to their associated callback functions.
-     * A bitmask represents a specific set of component types. When any of those
-     * components change on an entity, all registered callbacks for that mask are invoked.
-     * 
-     * Structure: Map<bitmask, [callback1, callback2, ...]>
-     */
-    const componentsChangedSignalCallbacks: Array<Array<((...args: number[]) => void)>> = new Array();
+    const freeEntityIdsArray : number[]   = [];
 
     /**
      * Central registry of all component types and their storage structures.
@@ -58,7 +53,15 @@ export namespace RblxECS {
      * 
      * This hybrid structure provides O(1) lookups and O(1) removal while maintaining cache locality.
      */
-    export const components: [ComponentsDenseArray<object>, EntityToComponentsSparseArray, ComponentToEntityDenseArray][] = [];
+    const components: [Array<object>, Array<number>,  Array<number>][] = [];
+
+    /**
+     * A collection of tag sets, where each set contains three arrays of numbers.
+     * Each array represents a different category or classification of numeric identifiers.
+     * 
+     * @type {[Array<number>, Array<number>, Array<number>][]}
+     */
+    const tags: [Array<number>, Array<number>, Array<number>][] = [];
 
     /**
      * Debug utilities for the ECS system.
@@ -234,8 +237,8 @@ export namespace RblxECS {
          * const Velocity = RblxECS.Component.createStrictComponent<Velocity>(1);
          * ```
          */
-        export function createStrictComponent<T extends object>(id: number): StrictComponent<T> {
-            return id as StrictComponent<T>;
+        export function createStrictComponent<T extends object>(): StrictComponent<T> {
+            return (nextComponentId += 1) as StrictComponent<T>;
         }
         
         /**
@@ -268,7 +271,7 @@ export namespace RblxECS {
          */
         export function get<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>): Readonly<T> | undefined {
             const [ entityId, _ ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to get a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to get a component for the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
             
             // Look up the component entry for the provided type.
             const componentEntry = components[component];
@@ -384,7 +387,7 @@ export namespace RblxECS {
          * console.log(removed ? "Component removed" : "Entity didn't have that component");
          * ```
          */
-        export function remove(entityHandle: EntityHandle, componentType: ComponentType): boolean {
+        export function remove(entityHandle: EntityHandle, componentType: number): boolean {
             const [ entityId ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to remove a component from stale entity handle ${entityId}.`);
 
@@ -420,88 +423,141 @@ export namespace RblxECS {
 
             return true;
         }
-
-        /**
-         * Creates a [ComponentType, data] tuple for returning from batch modification callbacks.
-         * 
-         * This helper function wraps component type and data into the format expected
-         * by batch modification callbacks, improving code clarity and type safety.
-         * 
-         * @template T - The component data type
-         * @param {ComponentType} componentType - The component type identifier
-         * @param {T} strictComponent - The component instance to return
-         * @returns {[ComponentType, T]} A tuple suitable for batch callback returns
-         * 
-         * @example
-         * ```typescript
-         * return RblxECS.Component.returnNewComponent(Position, newPosition);
-         * ```
-         */
-        export function returnNewComponent<T extends object>(componentType: ComponentType, strictComponent: T): [ComponentType, T] {
-            return [componentType, strictComponent];
-        }
     }
 
+
     /**
-     * Component change event system.
-     * 
-     * Manages subscriptions to component modifications. Uses efficient bitmask-based
-     * filtering to notify only interested listeners when relevant components change.
+     * Namespace for managing entity tags in the ECS system.
+     * Tags are lightweight markers that can be attached to entities for fast, efficient querying.
+     * Uses a dense array structure for O(1) lookup, addition, and removal operations.
      */
-    export namespace Events {
-            /**
-         * Subscribes a callback to be invoked when specified components change.
+    export namespace Tag {
+        /**
+         * Creates a new strict tag identifier.
+         * Each tag is assigned a unique incremental ID.
          * 
-         * Registers a listener that fires whenever any of the subscribed component types
-         * are modified on an entity through batch operations. The callback bitmask filters
-         * notifications to match exactly the subscribed set.
-         * 
-         * ## Subscription Model
-         * - Each unique set of component types gets its own callback list
-         * - A bitmask represents the component set (bit N is set if component N is included)
-         * - Callbacks are invoked with the modified component data in order
-         * - Changes are only reported when components are modified via batch operations
-         * 
-         * ## Memory Management
-         * The ECS maintains callback arrays per bitmask. Callbacks are never automatically
-         * unsubscribed; consider this when creating listeners in loops or dynamic contexts.
-         * 
-         * @template T - Tuple of subscribed StrictComponent types
-         * @param {Function} callback - Function invoked with modified component data
-         * @param {...StrictComponent[]} componentsToSubscribeFor - Component types to listen for
-         * @returns {void}
+         * @returns {StrictTag} A newly created unique tag identifier
          * 
          * @example
          * ```typescript
-         * RblxECS.Events.setComponentsChangedSignalCallback(
-         *   (position, velocity) => {
-         *     console.log(`Entity moved to ${position.x}, ${position.y}, ${position.z}`);
-         *   },
-         *   Position,
-         *   Velocity
-         * );
+         * const playerTag = Tag.createStrictTag();
          * ```
          */
-        export function setComponentsChangedSignalCallback<T extends StrictComponent<any>[]
-        >(
-            callback: CallbackWithSelectedStrictComponentsArguments<T>,
-            ...componentsToSubscribeFor: [...T]
-        ) {
-            let mask = 0;
-            for (const componentToSubscribeFor of componentsToSubscribeFor) {
-                mask |= (1 << componentToSubscribeFor);
+        export function createStrictTag(): StrictTag {
+            return (nextTagId += 1) as StrictTag;
+        } 
+
+        /**
+         * Checks if an entity has a specific tag.
+         * 
+         * @param {EntityHandle} entityHandle - The handle of the entity to check
+         * @param {StrictTag} tag - The tag to search for
+         * @returns {boolean} True if the entity has the tag, false otherwise
+         * 
+         * @example
+         * ```typescript
+         * if (Tag.has(playerEntity, isAliveTag)) {
+         *   // Entity is alive
+         * }
+         * ```
+         */
+        export function has(entityHandle: EntityHandle, tag: StrictTag): boolean {
+            const [ entityId ] = entityHandle;
+
+            const tagEntry = tags[tag];
+            if (tagEntry === undefined) return false;
+
+            const [ arrayEntitiesWithThisTag, arrayEntityToTag ] = tagEntry;
+            
+            const tagIndex = arrayEntityToTag[entityId];
+            if (tagIndex === undefined) return false;
+
+            return arrayEntitiesWithThisTag[tagIndex] !== undefined;
+        }
+
+        /**
+         * Adds a tag to an entity.
+         * Uses swap-and-pop technique to maintain dense array for cache efficiency.
+         * 
+         * @param {EntityHandle} entityHandle - The handle of the entity to tag
+         * @param {StrictTag} tag - The tag to add
+         * @returns {boolean} True if tag was successfully added
+         * @throws {Error} If entity is stale/invalid or tag already exists on entity
+         * 
+         * @example
+         * ```typescript
+         * Tag.add(playerEntity, isAliveTag);
+         * ```
+         */
+        export function add(entityHandle: EntityHandle, tag: StrictTag): boolean {
+            const [ entityId ] = entityHandle;
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot add a tag to the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
+
+            const tagEntry = tags[tag];
+            if (tagEntry === undefined) {
+                const [arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity] = [new Array<number>(), new Array<number>(), new Array<number>()];
+
+                arrayEntitiesWithThisTag.push(entityId);
+                const thisTagIndex = arrayEntitiesWithThisTag.size() - 1;
+
+                arrayEntityToTag[entityId] = thisTagIndex;
+                arrayTagToEntity[thisTagIndex] = entityId;
+
+                tags[tag] = [arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity];
+                return true;
             }
 
-            // At runtime, selected components are just numeric IDs hence we assert it to ...args: number[].
-            const callbacksArray = componentsChangedSignalCallbacks[mask];
-            if (callbacksArray === undefined) {
-                const newCallbacksArray = new Array<(...args: number[]) => void>();
-                newCallbacksArray.push(callback as (...args: number[]) => void);
-                componentsChangedSignalCallbacks[mask] = newCallbacksArray;
-                return;
-            }
+            const [ arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity ] = tagEntry;
 
-            callbacksArray.push(callback as (...args: number[]) => void);
+            const tagFromEntityId = arrayEntityToTag[entityId];
+            if (tagFromEntityId !== undefined) error(`Cannot add a tag to the entity with the ID of ${entityId}. The same tag has already been added to it.`);
+
+            arrayEntitiesWithThisTag.push(entityId);
+            const indexTag = arrayEntitiesWithThisTag.size() - 1;
+
+            arrayTagToEntity[indexTag] = entityId;
+            arrayEntityToTag[entityId] = indexTag;
+
+            return true;
+        }
+
+        /**
+         * Removes a tag from an entity.
+         * Uses swap-and-pop technique to maintain dense array structure.
+         * 
+         * @param {EntityHandle} entityHandle - The handle of the entity to untag
+         * @param {StrictTag} tag - The tag to remove
+         * @returns {boolean} True if tag was successfully removed, false if tag didn't exist on entity
+         * @throws {Error} If entity is stale/invalid
+         * 
+         * @example
+         * ```typescript
+         * Tag.remove(playerEntity, isAliveTag);
+         * ```
+         */
+        export function remove(entityHandle: EntityHandle, tag: StrictTag) {
+            const [ entityId ] = entityHandle;
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot add a tag to the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
+
+            const tagEntry = tags[tag];
+            if (tagEntry === undefined) return false;
+
+            const [ arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity ] = tagEntry;
+
+            const tagToRemoveFromEntityId    = arrayEntityToTag[entityId];
+            const lastIndexTag       = arrayEntitiesWithThisTag.size() - 1;
+
+            const entityIdFromLastIndexTag             = arrayTagToEntity[lastIndexTag];
+            arrayEntityToTag[entityIdFromLastIndexTag] = tagToRemoveFromEntityId;
+
+            [ arrayEntitiesWithThisTag[lastIndexTag], arrayEntitiesWithThisTag[tagToRemoveFromEntityId] ] =
+            [ arrayEntitiesWithThisTag[tagToRemoveFromEntityId], arrayEntitiesWithThisTag[lastIndexTag] ];
+
+            arrayEntitiesWithThisTag.pop();
+            delete arrayEntityToTag[entityId];
+            arrayTagToEntity.pop();
+
+            return true;
         }
     }
 }

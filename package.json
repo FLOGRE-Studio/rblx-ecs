@@ -1,6 +1,6 @@
 {
   "name": "@rbxts/rblx-ecs",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "main": "out/init.lua",
   "scripts": {
     "build": "rbxtsc",
@@ -8,8 +8,8 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "FORGE Studio",
+  "license": "MIT",
   "description": "",
   "types": "out/index.d.ts",
   "files": [

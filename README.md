@@ -12,6 +12,9 @@ Quick start
 1. Copy or install this module into your Roblox-TS project.
 2. Import the public namespace and create entities/components:
 
+# Components
+Components are typed data containers that attach to entities. Each component holds a specific piece of information (position, health, velocity, etc.) and is associated with a type identifier created via `RblxECS.Component.createStrictComponent<T>()`. The system stores all component instances in dense arrays for efficient iteration, while sparse maps allow fast O(1) lookups by entity. A single entity can have at most one component of each type attached to it.
+
 ```ts
 import { RblxECS } from "rblx-ecs";
 
@@ -32,6 +35,34 @@ const entity = RblxECS.Entity.createEntity();
 
 // Use RblxECS.Component APIs to register components and attach data
 const component = RblxECS.Component.get(Component)
+```
+
+
+
+# Tags
+
+Tags are lightweight, zero-data boolean markers that you can attach to entities to classify or categorize them via ``RblxECS.Tag.createStrictTag()``. Unlike components which carry data, tags are pure identifiers, they signal that an entity belongs to a certain group or has a certain property (e.g., isPlayer, isDead, isVisible). Tags are commonly used for filtering entities in systems, subscribing to specific entity groups, or implementing simple state flags without the overhead of storing component data.
+
+```ts
+import { RblxECS } from "rblx-ecs";
+
+// Define tag identifiers using the same API as components, but with an empty object type.
+const ECS = {
+    IsPlayer: RblxECS.Component.createStrictComponent<{}>(), 
+    IsEnemy: RblxECS.Component.createStrictComponent<{}>(),
+    IsAlive: RblxECS.Component.createStrictComponent<{}>(),
+};
+
+const entity = RblxECS.Entity.createEntity();
+
+// Attach a tag by adding a component with empty data.
+RblxECS.Component.addComponent(entity, ECS.IsPlayer, {});
+
+// Check if an entity has a tag.
+const hasTag = RblxECS.Component.getComponent(entity, ECS.IsPlayer) !== undefined;
+
+// Remove a tag.
+RblxECS.Component.removeComponent(entity, ECS.IsPlayer);
 ```
 
 Repository layout
