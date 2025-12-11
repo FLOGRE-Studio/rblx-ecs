@@ -50,7 +50,7 @@ Tags are lightweight, zero-data boolean markers that you can attach to entities 
 ```ts
 import { RblxECS } from "rblx-ecs";
 
-// Define tag identifiers using the same API as components, but with an empty object type.
+// Define tag identifiers using the same API as components with absolutely no data.
 const ECS = {
     Tags: {
         IsPlayer: RblxECS.Tag.createStrictTag(), 
@@ -64,7 +64,7 @@ const ECS = {
 const entity = RblxECS.Entity.createEntity();
 
 // Attach a tag by adding a component with empty data.
-RblxECS.Tag.add(entity, ECS.Tags.IsPlayer, {});
+RblxECS.Tag.add(entity, ECS.Tags.IsPlayer);
 
 // Check if an entity has a tag.
 const hasTag = RblxECS.Tag.has(entity, ECS.Tags.IsPlayer);
