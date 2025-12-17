@@ -6,558 +6,875 @@ import { isEntityValid } from "./utils/isEntityValid";
 /**
  * RblxECS
  *
- * Compact Entity Component System core for Roblox-TS projects.
+ * A high-performance Entity Component System (ECS) implementation for Roblox-TS projects.
  *
- * Concepts:
- * - Entities are represented as `[entityId, generation]` handles. Generations detect stale handles.
- * - Components are stored in dense arrays for fast iteration and mapped with sparse arrays for O(1) lookup.
- * - Event subscriptions use a bitmask per component-set to efficiently dispatch batched change notifications.
+ * ## Core Concepts
+ * 
+ * **Entities**: Unique identifiers represented as `[entityId, generation]` tuples.
+ * - entityId: Numeric identifier that may be recycled after entity destruction
+ * - generation: Counter incremented on each reuse to invalidate stale references
+ * 
+ * **Components**: Data containers stored in archetype-based storage:
+ * - Dense array: Contiguous memory layout for fast iteration
+ * - Sparse array: O(1) entity-to-component lookup
+ * - Bidirectional mapping: O(1) component-to-entity resolution for swap-and-pop
+ * 
+ * **Tags**: Lightweight boolean markers for entity categorization without data overhead.
+ * 
+ * ## Performance Characteristics
+ * - Entity creation: O(1) with ID recycling
+ * - Component add/remove: O(1) using swap-and-pop
+ * - Component lookup: O(1) via sparse array indexing
+ * - Iteration: Cache-friendly via dense array storage
  */
 export namespace RblxECS {
     /**
-     * The next unique entity ID to be allocated.
-     * Incremented when creating new entities; reused IDs come from freeEntityIdsArray instead.
+     * Monotonically increasing counter for entity ID allocation.
+     * Only incremented when the free pool is empty.
      */
-    let nextEntityId         : number     = 0;
-
-    let nextComponentId      : number     = 0;
-
-    let nextTagId            : number     = 0;
+    let nextEntityId: number = 0;
 
     /**
-     * Array of all currently active entity IDs.
-     * Includes both newly created and recycled entities that haven't been destroyed.
+     * Monotonically increasing counter for component type IDs.
+     * Each call to createStrictComponent() increments this.
      */
-    const entities           : number[] = [];
+    let nextComponentId: number = 0;
 
     /**
-     * Parallel array to entity IDs storing generation counters.
-     * Incremented each time an entity ID is reused after destruction.
-     * Used to validate EntityHandles and detect stale references.
+     * Monotonically increasing counter for tag type IDs.
+     * Each call to createStrictTag() increments this.
      */
-    const generationsArray   : number[]   = [];
+    let nextTagId: number = 0;
 
     /**
-     * Pool of entity IDs available for recycling.
-     * When an entity is destroyed, its ID is returned here instead of being discarded,
-     * reducing allocation pressure and maintaining stable ID ranges.
+     * Active entity IDs in the system.
+     * Contains only entity IDs that have been created and not yet destroyed.
+     * Note: This array is only appended to during new entity creation, not when recycling.
      */
-    const freeEntityIdsArray : number[]   = [];
+    const entities: number[] = [];
 
     /**
-     * Central registry of all component types and their storage structures.
+     * Generation counters indexed by entity ID.
+     * Incremented each time an entity ID is destroyed and recycled.
+     * Used to validate EntityHandle tuples and detect use-after-free.
      * 
-     * For each registered component type, stores:
-     * 1. ComponentsDenseArray: Contiguous array of component instances for cache efficiency
-     * 2. SparseEntityToComponentsMap: Maps entity IDs to indices in the dense array
-     * 
-     * This hybrid structure provides O(1) lookups and O(1) removal while maintaining cache locality.
+     * Example: If entity ID 5 has been destroyed and recreated twice,
+     * generationsArray[5] will be 2.
      */
-    const components: [Array<object>, Array<number>,  Array<number>][] = [];
+    const generationsArray: number[] = [];
 
     /**
-     * A collection of tag sets, where each set contains three arrays of numbers.
-     * Each array represents a different category or classification of numeric identifiers.
-     * 
-     * @type {[Array<number>, Array<number>, Array<number>][]}
+     * Pool of destroyed entity IDs available for reuse.
+     * When an entity is destroyed, its ID is pushed here.
+     * During entity creation, IDs are popped from this pool before allocating new ones.
+     * This reduces memory fragmentation and keeps entity IDs compact.
      */
-    const tags: [Array<number>, Array<number>, Array<number>][] = [];
+    const freeEntityIdsArray: number[] = [];
 
     /**
-     * Debug utilities for the ECS system.
+     * Component storage registry organized by component type ID.
      * 
-     * Provides logging and diagnostic capabilities to monitor and troubleshoot
-     * ECS operations during development.
+     * Structure: Array<[DenseComponents, SparseEntityToIndex, DenseIndexToEntity]>
+     * 
+     * For each component type (indexed by StrictComponent<T> ID):
+     * - [0] DenseComponents: Array<object> - Tightly packed component instances
+     * - [1] SparseEntityToIndex: Map<number, number> - Maps entityId → index in dense array
+     * - [2] SparseIndexToEntity: Map<number, number> - Maps dense array index → entityId
+     * 
+     * The third array enables O(1) swap-and-pop by quickly finding which entity
+     * owns the component being swapped from the end of the dense array.
+     */
+    const components: Map<number, [Array<object>, Map<number, number>, Map<number, number>]> = new Map();
+
+    /**
+     * Tag storage registry organized by tag type ID.
+     * 
+     * Structure: Array<[DenseEntityIds, SparseEntityToIndex, DenseIndexToEntity]>
+     * 
+     * For each tag type (indexed by StrictTag ID):
+     * - [0] DenseEntityIds: Array<number> - Tightly packed entity IDs with this tag
+     * - [1] SparseEntityToIndex: Map<number, number> - Maps entityId → index in dense array
+     * - [2] SparseIndexToEntity: Map<number, number> - Maps dense array index → entityId
+     * 
+     * Uses the same archetype pattern as components but stores only entity IDs
+     * since tags carry no data payload.
+     */
+    const tags: Map<number, [Array<number>, Map<number, number>, Map<number, number>]> = new Map();
+
+    /**
+     * Event registry for component addition callbacks.
+     * 
+     * Maps entity handles [entityId, generation] to callback functions invoked
+     * when a component is added to that entity.
+     * 
+     * @type Map<EntityHandle, (addedComponent: StrictComponent<unknown>) => void>
+     * 
+     * Callbacks are invoked via RblxECS.Component.add() after successful component attachment.
+     */
+    const onComponentAddedEventForEntities: Map<[number, number], (addedComponent: StrictComponent<unknown>) => void> = new Map(); 
+    
+    /**
+     * Event registry for component removal callbacks.
+     * 
+     * Maps entity handles [entityId, generation] to callback functions invoked
+     * when a component is removed from that entity.
+     * 
+     * @type Map<EntityHandle, (removedComponent: StrictComponent<unknown>) => void>
+     * 
+     * Callbacks are invoked via RblxECS.Component.remove() after successful component removal.
+     */
+    const onComponentRemovedEventForEntities: Map<[number, number], (removedComponent: StrictComponent<unknown>) => void> = new Map(); 
+    
+    /**
+     * Event registry for component mutation callbacks.
+     * 
+     * Maps entity handles [entityId, generation] to callback functions invoked
+     * when a component's data is mutably changed on that entity.
+     * 
+     * @type Map<EntityHandle, (changedComponent: StrictComponent<unknown>, changedData: unknown) => void>
+     * 
+     * Callbacks are invoked via RblxECS.Component.mutablyChange() after the mutation callback returns true.
+     */
+    const onComponentChangedEventForEntities: Map<[number, number], (changedComponent: StrictComponent<unknown>, changedData: unknown) => void> = new Map();
+
+    /**
+     * Event registry for tag addition callbacks.
+     * 
+     * Maps entity handles [entityId, generation] to callback functions invoked
+     * when a tag is added to that entity.
+     * 
+     * @type Map<EntityHandle, (addedTag: StrictTag) => void>
+     * 
+     * Callbacks are invoked via RblxECS.Tag.add() after successful tag attachment.
+     */
+    const onTagAddedEventForEntities: Map<[number, number], (addedTag: StrictTag) => void> = new Map(); 
+    
+    /**
+     * Event registry for tag removal callbacks.
+     * 
+     * Maps entity handles [entityId, generation] to callback functions invoked
+     * when a tag is removed from that entity.
+     * 
+     * @type Map<EntityHandle, (removedTag: StrictTag) => void>
+     * 
+     * Callbacks are invoked via RblxECS.Tag.remove() after successful tag removal.
+     */
+    const onTagRemovedEventForEntities: Map<[number, number], (removedTag: StrictTag) => void> = new Map(); 
+
+    /**
+     * Debugging utilities for monitoring ECS operations.
+     * Provides runtime logging and diagnostics during development.
      */
     export namespace Debugger {
         /**
-         * Enables or disables debug mode for the ECS logger.
+         * Toggles debug logging for all ECS operations.
          * 
-         * When enabled, the logger will output detailed information about ECS operations
-         * such as entity creation, destruction, and component modifications.
+         * When enabled, operations like entity creation, component addition,
+         * and entity destruction will output diagnostic information via RblxLogger.
          * 
-         * @param value - Whether debug mode should be enabled (true) or disabled (false)
+         * @param value - True to enable debug output, false to disable
          * 
          * @example
          * ```typescript
-         * RblxECS.Debugger.setIsDebugMode(true); // Enable debug logging
+         * RblxECS.Debugger.setIsDebugMode(true);
+         * const entity = RblxECS.Entity.createEntity(); // Will log creation
          * ```
          */
         export function setIsDebugMode(value: boolean) {
-            // Set debug mode for logging.
             RblxLogger.Configuration.inDebugMode = value;
         }
     }
 
     /**
-     * Entity lifecycle management.
+     * Entity lifecycle operations.
      * 
-     * Handles creation, destruction, and validation of entities.
-     * Maintains entity identity through generations and supports efficient ID recycling.
+     * Handles creation, destruction, and validation of entity handles.
+     * Implements generation-based validation to prevent use-after-free bugs.
      */
     export namespace Entity {
         /**
-         * Creates a new entity and returns its unique handle.
+         * Creates a new entity and returns a handle for component attachment.
          * 
-         * This function either recycles a freed entity ID or allocates a new one,
-         * then increments its generation counter. The returned EntityHandle can be used
-         * to add, remove, and query components throughout the entity's lifetime.
+         * ## Generation Semantics
+         * The generation counter prevents stale handle bugs. When entity ID 5
+         * is destroyed and later reused:
+         * - First creation: [5, 0]
+         * - After destruction and recreation: [5, 1]
+         * - Attempting to use [5, 0] will fail validation
          * 
-         * ## Allocation Strategy
-         * 1. If free IDs are available in the pool, pop and recycle one
-         * 2. Otherwise, allocate a new ID from the nextEntityId counter
-         * 3. Increment the generation for the selected ID
-         * 4. Add the ID to the global entities list (new IDs only)
-         * 
-         * ## Generation Tracking
-         * Entity generations prevent use-after-free bugs. Each time an ID is reused,
-         * its generation is incremented. Passing an outdated EntityHandle (with an old generation)
-         * to any operation will fail validation, protecting against logic errors.
-         * 
-         * @returns {EntityHandle} A tuple [entityId, generation] uniquely identifying the new entity
+         * @returns EntityHandle tuple [entityId, generation]
          * 
          * @example
          * ```typescript
-         * const entity = RblxECS.Entity.createEntity();
-         * const [id, generation] = entity;
-         * console.log(`Created entity ${id} at generation ${generation}`);
+         * const player = RblxECS.Entity.createEntity();
+         * const enemy = RblxECS.Entity.createEntity();
+         * // Each entity gets a unique handle
          * ```
          */
         export function createEntity(): EntityHandle {
-            // Check if any previously freed entity IDs are available for reuse
+            // Prioritize recycled IDs to keep the ID space compact
             if (freeEntityIdsArray.size() > 0) {
-                // Recycle an ID from the free list
-                const entityId = freeEntityIdsArray.pop()!;
+                const entityId = freeEntityIdsArray.shift()!;
 
-                // Increment the generation for this reused entity ID
-                const generationIncremented = (generationsArray[entityId] ?? -1) + 1; 
+                // Increment generation to invalidate old handles with this ID
+                const generationIncremented = (generationsArray[entityId] ?? -1) + 1;
                 generationsArray[entityId] = generationIncremented;
 
-                // Return the recycled entity's ID and updated generation
                 return [entityId, generationIncremented];
             } else {
-                // No reusable IDs; allocate a new entity ID
+                // No recycled IDs available, allocate a fresh one
                 const entityId = nextEntityId++;
 
-                // Initialize the generation for this new entity ID
-                const generationIncremented = (generationsArray[entityId] ?? -1) + 1; 
+                // Initialize generation counter for this new ID
+                const generationIncremented = (generationsArray[entityId] ?? -1) + 1;
                 generationsArray[entityId] = generationIncremented;
 
-                // Register the new entity in the global entity list
+                // Track this ID in the global entities list
                 entities.push(entityId);
 
-                // Return the new entity's ID and its initial generation
                 return [entityId, generationIncremented];
             }
         }
-        
+
         /**
-         * Destroys an entity and frees its resources.
+         * Destroys an entity and releases all associated resources.
          * 
-         * Removes all components attached to the entity, returns its ID to the free pool,
-         * and increments its generation counter. After destruction, the entity ID may be
-         * recycled for a new entity, rendering the old EntityHandle invalid.
+         * ## Important Notes
+         * - Does NOT remove the entity ID from the internal entities array
+         * - After destruction, the entity ID may be immediately reused
+         * - The old handle becomes permanently invalid due to generation mismatch
          * 
-         * ## Destruction Process
-         * 1. Validates the entity handle (checks generation and existence)
-         * 2. Iterates through all component types and removes matching components
-         * 3. Uses swap-and-pop removal to maintain dense array structure
-         * 4. Adds the entity ID back to the free pool
-         * 5. Increments generation to invalidate the handle
-         * 
-         * ## Error Handling
-         * If the entity has already been destroyed (stale handle), logs a warning
-         * and returns false without performing any operations.
-         * 
-         * @param {EntityHandle} entityHandle - The handle of the entity to destroy
-         * @returns {boolean} True if destruction succeeded, false if the handle was invalid/stale
+         * @param entityHandle - The entity to destroy
+         * @returns False if handle was already stale, true otherwise
          * 
          * @example
          * ```typescript
          * const entity = RblxECS.Entity.createEntity();
-         * RblxECS.Entity.destroyEntity(entity); // Entity is now destroyed
-         * // Using entity handle here would fail validation
+         * RblxECS.Component.add(entity, Position, { x: 0, y: 0 });
+         * RblxECS.Entity.destroyEntity(entity);
+         * // entity handle is now invalid, Position component is removed
          * ```
          */
-        export function destroyEntity(entityHandle: EntityHandle) {
-            const [ entityId, generation ] = entityHandle;
+        export function destroyEntity(entityHandle: EntityHandle): boolean {
+            const [entityId, generation] = entityHandle;
+
+            // Verify this handle hasn't already been invalidated
             if (!isEntityValid(entityHandle, generationsArray)) {
-                RblxLogger.logOutput("RblxECS.destroyEntity", `The entity with ID of ${entityHandle[0]} has been destroyed already before. Ignoring this operation.`);
+                RblxLogger.logOutput(
+                    "RblxECS.destroyEntity",
+                    `Entity ID ${entityId} has already been destroyed. Ignoring duplicate destroy.`
+                );
                 return false;
             }
 
-            for (let componentType = 0; componentType < components.size(); componentType++) {
-                const componentBucket = components[componentType];
-
-                if (componentBucket === undefined) {
-                    RblxLogger.errorOutput("RblxECS.destroyEntity", `either componentsDenseArray or entityToComponentsSparseArray is undefined.`);
-                    continue;
-                }
-
-                RblxECS.Component.remove(entityHandle, componentType);
-
+            for (const [componentType, _] of components) {
+                // Remove component if present (no-op if entity doesn't have it)
+                RblxECS.Component.remove(entityHandle, componentType as StrictComponent<unknown>);
             }
 
+            for (const [tagType, _] of tags) {
+                // Remove tag if present (no-op if entity doesn't have it)
+                RblxECS.Tag.remove(entityHandle, tagType as StrictTag);
+            }
+
+            onComponentAddedEventForEntities.delete(entityHandle);
+            onComponentRemovedEventForEntities.delete(entityHandle);
+            onComponentChangedEventForEntities.delete(entityHandle);
+            onTagAddedEventForEntities.delete(entityHandle);
+            onTagRemovedEventForEntities.delete(entityHandle);
+
+            // Increment generation to invalidate this handle
             const generationIncremented = generation + 1;
 
+            // Return ID to free pool for recycling
             freeEntityIdsArray.push(entityId);
             generationsArray[entityId] = generationIncremented;
-        }
-    }
-
-    /**
-     * Component attachment and querying.
-     * 
-     * Manages component registration, attachment to entities, and type-safe retrieval.
-     * Supports adding, removing, and querying components with full TypeScript type safety.
-     */
-    export namespace Component {
-        /**
-         * Creates a branded StrictComponent type identifier.
-         * 
-         * This function creates a unique numeric identifier for a component type that carries
-         * TypeScript generic information about the component's data structure. The identifier
-         * is used internally for storage and lookup, while the generic type provides compile-time
-         * type safety for component data.
-         * 
-         * ## Type Safety
-         * The generic parameter T determines what data shape is associated with this component.
-         * All operations using this StrictComponent ID will be type-checked against T.
-         * 
-         * @template T - The component data structure (must be an object type)
-         * @param {number} id - A unique numeric identifier for this component type
-         * @returns {StrictComponent<T>} A branded numeric type representing this component
-         * 
-         * @example
-         * ```typescript
-         * interface Position { x: number; y: number; z: number }
-         * const Position = RblxECS.Component.createStrictComponent<Position>(0);
-         * 
-         * interface Velocity { x: number; y: number; z: number }
-         * const Velocity = RblxECS.Component.createStrictComponent<Velocity>(1);
-         * ```
-         */
-        export function createStrictComponent<T extends object>(): StrictComponent<T> {
-            return (nextComponentId += 1) as StrictComponent<T>;
-        }
-        
-        /**
-         * Retrieves a component from an entity.
-         * 
-         * Queries the component storage structures to find and return a component instance
-         * attached to the given entity. Returns undefined if the entity doesn't have the component
-         * or if the component type isn't registered.
-         * 
-         * ## Lookup Process
-         * 1. Validates the entity handle (generation and existence)
-         * 2. Looks up the component type in the storage map
-         * 3. Uses the sparse map to find the component's index in the dense array
-         * 4. Returns the component instance or undefined if not found
-         * 
-         * @template T - The component data type
-         * @param {EntityHandle} entityHandle - The entity to query
-         * @param {StrictComponent<T>} component - The component type to retrieve
-         * @returns {T | undefined} The component instance if attached, undefined otherwise
-         * 
-         * @throws {Error} If the entity handle is stale or invalid
-         * 
-         * @example
-         * ```typescript
-         * const position = RblxECS.Component.get(entity, Position);
-         * if (position) {
-         *   console.log(`Entity at ${position.x}, ${position.y}, ${position.z}`);
-         * }
-         * ```
-         */
-        export function get<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>): Readonly<T> | undefined {
-            const [ entityId, _ ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to get a component for the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
-            
-            // Look up the component entry for the provided type.
-            const componentEntry = components[component];
-
-            if (componentEntry === undefined) {
-                RblxLogger.errorOutput("RblxECS.destroyEntity", `either ComponentsDenseArray or EntityToComponentsSparseArray is undefined.`);
-                return undefined;
-            }
-
-            const [ComponentsDenseArray, EntityToComponentsSparseArray] = componentEntry;
-
-
-            // Find the index of the component for this entity.
-            const componentIndex = EntityToComponentsSparseArray[entityId];
-            
-            if (componentIndex === undefined) {
-                return undefined;
-            }
-
-            // Return the component instance from the dense array.
-            return ComponentsDenseArray[componentIndex] as T;
-        }
-
-        /**
-         * Attaches a component instance to an entity.
-         * 
-         * Adds a component with the provided data to the given entity. If this is the first
-         * time the component type is being added to any entity, initializes the storage structures.
-         * Multiple components of the same type cannot be attached to one entity (subsequent calls overwrite).
-         * 
-         * ## Storage Mechanism
-         * 1. Validates the entity handle
-         * 2. Retrieves or initializes storage structures for the component type
-         * 3. Appends the component data to the dense array
-         * 4. Records the entity-to-index mapping in the sparse map
-         * 5. Updates the global component registry
-         * 
-         * @template T - The component data type
-         * @param {EntityHandle} entityHandle - The entity to attach to
-         * @param {StrictComponent<T>} componentType - The component type identifier
-         * @param {T} strictComponent - The component data instance
-         * @returns {void}
-         * 
-         * @throws {Error} If the entity handle is stale or invalid
-         * 
-         * @example
-         * ```typescript
-         * const positionData = { x: 10, y: 20, z: 30 };
-         * RblxECS.Component.add(entity, Position, positionData);
-         * ```
-         */
-        export function add<T extends object>(entityHandle: EntityHandle, componentType: StrictComponent<T>, strictComponent: T): void {
-            const [ entityId, generation ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the entity handle itself is stale and outdated.`);
-
-            const componentEntry = components[componentType];
-
-            if (componentEntry === undefined) {
-                const denseArraycomponents           = new Array<object>();
-                const sparseArrayEntityToComponents  = new Array<number>();
-                const denseArrayComponentsToEntity   = new Array<number>();
-
-                // Store the component data in the dense array.
-                denseArraycomponents.push(strictComponent);
-                const newLastIndex = denseArraycomponents.size() - 1;
-
-                sparseArrayEntityToComponents[entityId]      = newLastIndex;
-                denseArrayComponentsToEntity[newLastIndex]   = entityId;
-                
-                // Update the mapping for this component type.
-                components[componentType] = [denseArraycomponents, sparseArrayEntityToComponents, denseArrayComponentsToEntity];
-            } else {
-                const [denseArraycomponents, sparseArrayEntityToComponents, denseArrayComponentsToEntity] = components[componentType];
-                                
-                const index = sparseArrayEntityToComponents[entityId];
-                if (index !== undefined) error(`Failed to add a component to the entity handle with the ID of ${entityId}, the same component with the same type has already been added to it.`);
-
-                // Store the component data in the dense array.
-                denseArraycomponents.push(strictComponent);
-                const lastIndex = denseArraycomponents.size() - 1;
-
-                sparseArrayEntityToComponents[entityId] = lastIndex;
-                denseArrayComponentsToEntity[lastIndex] = entityId;
-            }
-        }
-
-        /**
-         * Removes a component from an entity.
-         * 
-         * Detaches and deletes a component from the given entity. Uses swap-and-pop removal
-         * to maintain the density of the component array and update affected mappings.
-         * 
-         * ## Removal Process
-         * 1. Validates the entity handle
-         * 2. Looks up the component in the storage structures
-         * 3. Swaps the target component with the last element in the dense array
-         * 4. Updates the mapping for the swapped component's owner entity
-         * 5. Removes the component from all storage structures
-         * 
-         * ## Performance
-         * Swap-and-pop ensures O(1) removal and maintains cache locality by keeping
-         * all active components contiguous in memory.
-         * 
-         * @param {EntityHandle} entityHandle - The entity to remove from
-         * @param {ComponentType} componentType - The component type to remove
-         * @returns {boolean} True if removal succeeded, false if the entity didn't have the component
-         * 
-         * @throws {Error} If the entity handle is stale or invalid
-         * 
-         * @example
-         * ```typescript
-         * const removed = RblxECS.Component.remove(entity, Position);
-         * console.log(removed ? "Component removed" : "Entity didn't have that component");
-         * ```
-         */
-        export function remove(entityHandle: EntityHandle, componentType: number): boolean {
-            const [ entityId ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Failed to remove a component from stale entity handle ${entityId}.`);
-
-            const componentEntry = components[componentType];
-            if (componentEntry === undefined) return false;
-
-            const [denseArrayComponents, sparseArrayEntityToComponents, denseArrayComponentToEntity] = componentEntry;
-
-            const indexOfComponentToRemove = sparseArrayEntityToComponents[entityId];
-            if (indexOfComponentToRemove === undefined) return false;
-
-            const lastIndexOfDenseArrayComponentToSwap = denseArrayComponents.size() - 1;
-            const lastIndexOfSpraseArrayEntityToSwap = sparseArrayEntityToComponents.size() - 1;
-
-            if (indexOfComponentToRemove !== lastIndexOfDenseArrayComponentToSwap) {
-                const entityIdToBeSwapped = denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap];
-            
-                // Component to remove swapped at its current index position with another component at the last index position.
-                [denseArrayComponents[indexOfComponentToRemove], denseArrayComponents[lastIndexOfDenseArrayComponentToSwap]] =
-                [denseArrayComponents[lastIndexOfDenseArrayComponentToSwap], denseArrayComponents[indexOfComponentToRemove]];
-
-                sparseArrayEntityToComponents[entityIdToBeSwapped] = indexOfComponentToRemove;
-
-                // Component to remove for entity (THIS entity) swapped at its current index position with another component for another entity at the last index position.
-                [denseArrayComponentToEntity[indexOfComponentToRemove], denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap]] =
-                [denseArrayComponentToEntity[lastIndexOfDenseArrayComponentToSwap], denseArrayComponentToEntity[indexOfComponentToRemove]]
-            }
-
-            // Remove the last element
-            denseArrayComponents.pop();
-            delete sparseArrayEntityToComponents[entityId];
-            denseArrayComponentToEntity.pop();
 
             return true;
         }
     }
 
-
     /**
-     * Namespace for managing entity tags in the ECS system.
-     * Tags are lightweight markers that can be attached to entities for fast, efficient querying.
-     * Uses a dense array structure for O(1) lookup, addition, and removal operations.
+     * Component management operations.
+     * 
+     * Provides type-safe component registration, attachment, retrieval, and removal.
+     * Uses archetype-based storage with dense arrays for iteration and sparse arrays
+     * for O(1) random access.
      */
-    export namespace Tag {
+    export namespace Component {
         /**
-         * Creates a new strict tag identifier.
-         * Each tag is assigned a unique incremental ID.
+         * Registers a new component type and returns a type-safe identifier.
          * 
-         * @returns {StrictTag} A newly created unique tag identifier
+         * The returned StrictComponent<T> is a branded type that carries TypeScript
+         * generic information about the component's data structure. This enables
+         * compile-time type checking for all component operations.
+         * 
+         * @template T - The component data structure (must extend object)
+         * @returns Unique numeric identifier branded with type T
          * 
          * @example
          * ```typescript
-         * const playerTag = Tag.createStrictTag();
+         * interface Position { x: number; y: number; z: number }
+         * const Position = RblxECS.Component.createStrictComponent<Position>();
+         * 
+         * interface Velocity { dx: number; dy: number; dz: number }
+         * const Velocity = RblxECS.Component.createStrictComponent<Velocity>();
+         * 
+         * // These are now type-safe - TypeScript knows their shapes
+         * ```
+         */
+        export function createStrictComponent<T extends object>(): StrictComponent<T> {
+            // Pre-increment to start IDs at 1 (0 might be reserved or falsy)
+            return (nextComponentId += 1) as StrictComponent<T>;
+        }
+
+        /**
+         * Retrieves a component instance from an entity.
+         * 
+         * Returns undefined if:
+         * - Component type has never been registered
+         * - Entity doesn't have this component attached
+         * 
+         * @returns Component data as readonly (readonly reference), or undefined
+         * @throws Error if entity handle is stale
+         * @remarks Do NOT mutate the returned value directly. Use `Component.mutablyChange`
+         * when you need to perform in-place updates so change events and internal
+         * bookkeeping remain correct.
+         * 
+         * @example
+         * ```typescript
+         * const position = RblxECS.Component.get(player, Position);
+         * if (position) {
+         *   print(`Player at (${position.x}, ${position.y}, ${position.z})`);
+         * }
+         * ```
+         */
+        export function get<T extends object>(
+            entityHandle: EntityHandle,
+            component: StrictComponent<T>
+        ): Readonly<T> | undefined {
+            const [entityId, _] = entityHandle;
+
+            // Ensure handle hasn't been invalidated by entity destruction
+            if (!isEntityValid(entityHandle, generationsArray)) {
+                error(
+                    `Failed to get component for entity ID ${entityId}. ` +
+                    `Handle is stale (generation mismatch).`
+                );
+            }
+
+            // Retrieve the storage bucket for this component type
+            const componentEntry = components.get(component);
+
+            if (componentEntry === undefined) {
+                RblxLogger.errorOutput(
+                    "RblxECS.Component.get",
+                    `Component type ${component} has not been registered.`
+                );
+                return undefined;
+            }
+
+            const [componentsDenseArray, entityToComponentsSparseArray] = componentEntry;
+
+            // Look up the dense array index for this entity
+            const componentIndex = entityToComponentsSparseArray.get(entityId);
+
+            if (componentIndex === undefined) {
+                // Entity doesn't have this component
+                return undefined;
+            }
+
+            // Return the component instance (cast is safe due to type branding)
+            return componentsDenseArray[componentIndex] as T;
+        }
+
+        /**
+         * Mutably modifies a component's data for a specific entity by invoking a callback function.
+         * The callback is invoked with the component data, allowing in-place mutations to occur.
+         * This also invokes all callbacks listening for a changed component for the specific entity.
+         * 
+         * @template T - The type of the component data, constrained to be an object type.
+         * @param entityHandle - A handle referencing the entity whose component will be modified.
+         * @param component - The component identifier to modify on the entity.
+         * @param callback - A function invoked with the component data to perform mutations. Return value is unused.
+         *
+         * @returns void
+         *
+         * @throws Throws an error if the entity handle is stale or outdated.
+         * @throws Throws an error if the component does not exist in the ECS system.
+         * @throws Throws an error if the specified entity does not have the requested component.
+         */
+        export function mutablyChange<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>, callback: (data: T) => boolean): void {
+            const [ entityId ] = entityHandle;
+            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot mutably change a component data for the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
+
+            const componentEntry = components.get(component);
+            if (componentEntry === undefined) error(`Cannot mutably change a component data for the entity with the ID of ${entityId}. No such component with the ID of ${component} of any entity has been found to be modified.`);
+
+            const [ denseArrayComponents, sparseArrayEntityToComponents ] = componentEntry;
+            const componentIndex = sparseArrayEntityToComponents.get(entityId)!;
+            
+            const denseComponent = denseArrayComponents[componentIndex] as T;
+            if (denseComponent === undefined) error(`Cannot mutably change a component data for the entity with the ID of ${entityId}. This entity has no such component to be modified.`);
+
+            const isChanged = callback(denseComponent);
+
+            // Does nothing if the component data is not changed (false).
+            if (isChanged !== undefined) {
+                // Invoke this callback if it exists for this entity.
+                onComponentChangedEventForEntities.get(entityHandle)?.(component, denseArrayComponents[componentIndex]);
+            }
+        }
+
+        /**
+         * Attaches a component to an entity.
+         * 
+         * @template T - The component data type
+         * @param entityHandle - The entity to attach to
+         * @param componentType - The component type identifier
+         * @param strictComponent - The component data instance
+         * @throws Error if entity is stale or already has this component type
+         * 
+         * @example
+         * ```typescript
+         * const entity = RblxECS.Entity.createEntity();
+         * RblxECS.Component.add(entity, Position, { x: 10, y: 20, z: 30 });
+         * RblxECS.Component.add(entity, Velocity, { dx: 1, dy: 0, dz: 0 });
+         * ```
+         */
+        export function add<T extends object>(
+            entityHandle: EntityHandle,
+            componentType: StrictComponent<T>,
+            strictComponent: T
+        ): void {
+            const [entityId, generation] = entityHandle;
+
+            // Validate handle before modifying storage
+            if (!isEntityValid(entityHandle, generationsArray)) {
+                error(
+                    `Failed to add component to entity ID ${entityId}. ` +
+                    `Handle is stale (generation mismatch).`
+                );
+            }
+
+            const componentEntry = components.get(componentType);
+
+            if (componentEntry === undefined) {
+                // First time this component type is being used - initialize storage
+                const denseArraycomponents = new Array<object>();
+                const sparseArrayEntityToComponents = new Map<number, number>();
+                const denseArrayComponentsToEntity = new Map<number, number>();
+
+                // Add the component data
+                denseArraycomponents.push(strictComponent);
+                const newLastIndex = denseArraycomponents.size() - 1;
+
+                // Establish bidirectional mapping
+                sparseArrayEntityToComponents.set(entityId, newLastIndex);
+                denseArrayComponentsToEntity.set(newLastIndex, entityId);
+
+                // Register the storage bucket
+                components.set(componentType, [
+                    denseArraycomponents,
+                    sparseArrayEntityToComponents,
+                    denseArrayComponentsToEntity,
+                ]);
+            } else {
+                // Component type already registered, add to existing storage
+                const [
+                    denseArraycomponents,
+                    sparseArrayEntityToComponents,
+                    denseArrayComponentsToEntity,
+                ] = components.get(componentType)!;
+
+                // Check if entity already has this component
+                const index = sparseArrayEntityToComponents.get(entityId);
+                if (index !== undefined) {
+                    error(
+                        `Failed to add component to entity ID ${entityId}. ` +
+                        `Entity already has a component of type ${componentType}.`
+                    );
+                }
+
+                // Append component to dense array
+                denseArraycomponents.push(strictComponent);
+                const lastIndex = denseArraycomponents.size() - 1;
+
+
+                // Update both mappings
+                sparseArrayEntityToComponents.set(entityId, lastIndex);
+                denseArrayComponentsToEntity.set(lastIndex, entityId);
+            }
+
+            // Fire a callback for an added component if it exists.
+            onComponentAddedEventForEntities.get(entityHandle)?.(componentType);
+        }
+
+        /**
+         * Removes a component from an entity using swap-and-pop.
+         * 
+         * @param entityHandle - The entity to remove from
+         * @param componentType - The component type to remove (numeric for internal use)
+         * @returns True if removed, false if component wasn't present
+         * @throws Error if entity handle is stale
+         * 
+         * @example
+         * ```typescript
+         * const removed = RblxECS.Component.remove(entity, Position);
+         * if (removed) {
+         *   print("Position component removed");
+         * }
+         * ```
+         */
+        export function remove<T>(entityHandle: EntityHandle, componentType: StrictComponent<T>): boolean {
+            const [entityId] = entityHandle;
+
+            // Validate handle before modifying storage
+            if (!isEntityValid(entityHandle, generationsArray)) {
+                error(`Failed to remove component from stale entity handle ${entityId}.`);
+            }
+
+            // Retrieve storage bucket for this component type
+            const componentEntry = components.get(componentType);
+            if (componentEntry === undefined) return false;
+
+            const [
+                denseArrayComponents,
+                sparseArrayEntityToComponents,
+                denseArrayComponentToEntity,
+            ] = componentEntry;
+
+            // Find the component's index in the dense array
+            const indexOfComponentToRemove = sparseArrayEntityToComponents.get(entityId);
+            if (indexOfComponentToRemove === undefined) return false;
+
+            const lastIndexOfDenseArrayComponentToSwap = denseArrayComponents.size() - 1;
+
+            // Only swap if we're not already removing the last element
+            if (indexOfComponentToRemove !== lastIndexOfDenseArrayComponentToSwap) {
+                // Find which entity owns the component at last index we're about to swap
+                const entityIdToBeSwapped = denseArrayComponentToEntity.get(lastIndexOfDenseArrayComponentToSwap)!;
+
+                // Swap components in dense array
+                [
+                    denseArrayComponents[indexOfComponentToRemove],
+                    denseArrayComponents[lastIndexOfDenseArrayComponentToSwap],
+                ] = [
+                    denseArrayComponents[lastIndexOfDenseArrayComponentToSwap],
+                    denseArrayComponents[indexOfComponentToRemove],
+                ];
+
+                // Update sparse mapping for the swapped component's owner
+                sparseArrayEntityToComponents.set(entityIdToBeSwapped, indexOfComponentToRemove);
+
+                // Update sparse component-to-entity mapping for last component -> swapped entity ID.
+                denseArrayComponentToEntity.set(indexOfComponentToRemove, entityIdToBeSwapped);
+            }
+
+            // Remove the last element (which now contains the removed component)
+            denseArrayComponents.pop();
+
+            // Delete the entity ID to component reference as it'd still point to the removed component otherwise.
+            sparseArrayEntityToComponents.delete(entityId);
+
+            /**
+            * Clean up the outdated reference between the component at last index and the respective entity ID as the swapped component mapping
+            * (at index of removed component) has been updated to correctly point to the same entity ID.
+            */
+            denseArrayComponentToEntity.delete(lastIndexOfDenseArrayComponentToSwap);
+
+            // Fire a callback for a removed component if it exists.
+            onComponentRemovedEventForEntities.get(entityHandle)?.(componentType);
+
+            return true;
+        }
+    }
+
+    /**
+     * Tag management operations.
+     * 
+     * Tags are lightweight boolean markers for entity categorization.
+     * Unlike components, tags carry no data payload, making them ideal for
+     * filtering entities (e.g., "IsAlive", "IsPlayer", "NeedsUpdate").
+     * 
+     * Uses the same archetype storage pattern as components but stores
+     * only entity IDs instead of component data.
+     */
+    export namespace Tag {
+        /**
+         * Registers a new tag type and returns a unique identifier.
+         * 
+         * @returns Unique numeric tag identifier
+         * 
+         * @example
+         * ```typescript
+         * const IsAlive = RblxECS.Tag.createStrictTag();
+         * const IsPlayer = RblxECS.Tag.createStrictTag();
+         * const NeedsRendering = RblxECS.Tag.createStrictTag();
          * ```
          */
         export function createStrictTag(): StrictTag {
+            // Pre-increment to start tag IDs at 1
             return (nextTagId += 1) as StrictTag;
-        } 
+        }
 
         /**
          * Checks if an entity has a specific tag.
          * 
-         * @param {EntityHandle} entityHandle - The handle of the entity to check
-         * @param {StrictTag} tag - The tag to search for
-         * @returns {boolean} True if the entity has the tag, false otherwise
+         * @param entityHandle - The entity to check
+         * @param tag - The tag to search for
+         * @returns True if entity has the tag, false otherwise
          * 
          * @example
          * ```typescript
-         * if (Tag.has(playerEntity, isAliveTag)) {
-         *   // Entity is alive
+         * if (RblxECS.Tag.has(entity, IsAlive)) {
+         *   // Process living entity
          * }
          * ```
          */
         export function has(entityHandle: EntityHandle, tag: StrictTag): boolean {
-            const [ entityId ] = entityHandle;
+            const [entityId] = entityHandle;
 
-            const tagEntry = tags[tag];
+            // Retrieve tag storage bucket
+            const tagEntry = tags.get(tag);
             if (tagEntry === undefined) return false;
 
-            const [ arrayEntitiesWithThisTag, arrayEntityToTag ] = tagEntry;
-            
-            const tagIndex = arrayEntityToTag[entityId];
+            const [arrayEntitiesWithThisTag, arrayEntityToTag] = tagEntry;
+
+            // Find index in dense array via sparse mapping
+            const tagIndex = arrayEntityToTag.get(entityId);
             if (tagIndex === undefined) return false;
 
+            // Verify the entity ID is actually stored at this index
             return arrayEntitiesWithThisTag[tagIndex] !== undefined;
         }
 
         /**
          * Adds a tag to an entity.
-         * Uses swap-and-pop technique to maintain dense array for cache efficiency.
-         * 
-         * @param {EntityHandle} entityHandle - The handle of the entity to tag
-         * @param {StrictTag} tag - The tag to add
-         * @returns {boolean} True if tag was successfully added
-         * @throws {Error} If entity is stale/invalid or tag already exists on entity
+         *
+         * @param entityHandle - The entity to tag
+         * @param tag - The tag to add
+         * @returns True on success
+         * @throws Error if entity is stale or already has this tag
          * 
          * @example
          * ```typescript
-         * Tag.add(playerEntity, isAliveTag);
+         * RblxECS.Tag.add(player, IsAlive);
+         * RblxECS.Tag.add(player, IsPlayer);
          * ```
          */
         export function add(entityHandle: EntityHandle, tag: StrictTag): boolean {
-            const [ entityId ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot add a tag to the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
+            const [entityId] = entityHandle;
 
-            const tagEntry = tags[tag];
+            // Validate handle before modifying storage
+            if (!isEntityValid(entityHandle, generationsArray)) {
+                error(
+                    `Cannot add tag to entity ID ${entityId}. ` +
+                    `Handle is stale (generation mismatch).`
+                );
+            }
+
+            const tagEntry = tags.get(tag);
+
             if (tagEntry === undefined) {
-                const [arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity] = [new Array<number>(), new Array<number>(), new Array<number>()];
+                // First time this tag is being used - initialize storage
+                const [arrayEntitiesWithThisTag, sparseMapEntityToTag, sparseMapTagToEntity] = [
+                    new Array<number>(),
+                    new Map<number, number>(),
+                    new Map<number, number>(),
+                ];
 
+                // Add entity ID to dense array
                 arrayEntitiesWithThisTag.push(entityId);
                 const thisTagIndex = arrayEntitiesWithThisTag.size() - 1;
 
-                arrayEntityToTag[entityId] = thisTagIndex;
-                arrayTagToEntity[thisTagIndex] = entityId;
+                // Establish bidirectional mapping
+                sparseMapEntityToTag.set(entityId, thisTagIndex);
+                sparseMapTagToEntity.set(thisTagIndex, entityId);
 
-                tags[tag] = [arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity];
+                // Register the storage bucket
+                tags.set(tag, [arrayEntitiesWithThisTag, sparseMapEntityToTag, sparseMapTagToEntity]);
+
+                // Fire a callback for an added tag if it exists.
+                onTagAddedEventForEntities.get(entityHandle)?.(tag);
+
                 return true;
             }
 
-            const [ arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity ] = tagEntry;
+            // Tag already registered, add to existing storage
+            const [arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity] = tagEntry;
 
-            const tagFromEntityId = arrayEntityToTag[entityId];
-            if (tagFromEntityId !== undefined) error(`Cannot add a tag to the entity with the ID of ${entityId}. The same tag has already been added to it.`);
+            // Check if entity already has this tag
+            const tagFromEntityId = arrayEntityToTag.get(entityId);
+            if (tagFromEntityId !== undefined) {
+                error(
+                    `Cannot add tag to entity ID ${entityId}. ` +
+                    `Entity already has this tag.`
+                );
+            }
 
+            // Append entity ID to dense array
             arrayEntitiesWithThisTag.push(entityId);
             const indexTag = arrayEntitiesWithThisTag.size() - 1;
 
-            arrayTagToEntity[indexTag] = entityId;
-            arrayEntityToTag[entityId] = indexTag;
+            // Update both mappings
+            arrayTagToEntity.set(indexTag, entityId);
+            arrayEntityToTag.set(entityId, indexTag);
+
+            // Fire a callback for an added tag if it exists.
+            onTagAddedEventForEntities.get(entityHandle)?.(tag);
 
             return true;
         }
 
         /**
-         * Removes a tag from an entity.
-         * Uses swap-and-pop technique to maintain dense array structure.
-         * 
-         * @param {EntityHandle} entityHandle - The handle of the entity to untag
-         * @param {StrictTag} tag - The tag to remove
-         * @returns {boolean} True if tag was successfully removed, false if tag didn't exist on entity
-         * @throws {Error} If entity is stale/invalid
-         * 
+         * Removes a tag from an entity using swap-and-pop on the dense storage
+         * while updating the accompanying sparse Maps.
+         *
+         * Invokes any registered `onTagRemovedEventForEntities` callback for the entity.
+         *
+         * @param entityHandle - The entity to untag
+         * @param tag - The tag to remove
+         * @returns True if removed, false if tag wasn't present
+         * @throws Error if entity handle is stale
+         *
          * @example
          * ```typescript
-         * Tag.remove(playerEntity, isAliveTag);
+         * RblxECS.Tag.remove(enemy, IsAlive); // Enemy died
          * ```
          */
         export function remove(entityHandle: EntityHandle, tag: StrictTag) {
-            const [ entityId ] = entityHandle;
-            if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot add a tag to the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
+            const [entityId] = entityHandle;
 
-            const tagEntry = tags[tag];
+            // Validate handle before modifying storage
+            if (!isEntityValid(entityHandle, generationsArray)) {
+                error(
+                    `Cannot remove tag from entity ID ${entityId}. ` +
+                    `Handle is stale (generation mismatch).`
+                );
+            }
+
+            // Retrieve tag storage bucket
+            const tagEntry = tags.get(tag);
             if (tagEntry === undefined) return false;
 
-            const [ arrayEntitiesWithThisTag, arrayEntityToTag, arrayTagToEntity ] = tagEntry;
+            const [arrayEntitiesWithThisTag, sparseMapEntityToTag, sparseMapTagToEntity] = tagEntry;
 
-            const tagToRemoveFromEntityId    = arrayEntityToTag[entityId];
-            const lastIndexTag       = arrayEntitiesWithThisTag.size() - 1;
+            // Find the entity's index in the dense array
+            const indexTagToRemoveFromEntityId = sparseMapEntityToTag.get(entityId);
+            if (indexTagToRemoveFromEntityId === undefined) return false;
 
-            const entityIdFromLastIndexTag             = arrayTagToEntity[lastIndexTag];
-            arrayEntityToTag[entityIdFromLastIndexTag] = tagToRemoveFromEntityId;
+            const lastIndexTag = arrayEntitiesWithThisTag.size() - 1;
 
-            [ arrayEntitiesWithThisTag[lastIndexTag], arrayEntitiesWithThisTag[tagToRemoveFromEntityId] ] =
-            [ arrayEntitiesWithThisTag[tagToRemoveFromEntityId], arrayEntitiesWithThisTag[lastIndexTag] ];
+            // Find which entity owns the tag we're about to swap
+            const entityIdFromLastIndexTag = sparseMapTagToEntity.get(lastIndexTag)!;
+            
+            // Update sparse mapping for the entity being swapped
+            sparseMapEntityToTag.set(entityIdFromLastIndexTag, indexTagToRemoveFromEntityId);
+            sparseMapTagToEntity.set(indexTagToRemoveFromEntityId, entityIdFromLastIndexTag);
 
+            // Swap entity IDs in dense array
+            [
+                arrayEntitiesWithThisTag[lastIndexTag],
+                arrayEntitiesWithThisTag[indexTagToRemoveFromEntityId],
+            ] = [
+                arrayEntitiesWithThisTag[indexTagToRemoveFromEntityId],
+                arrayEntitiesWithThisTag[lastIndexTag],
+            ];
+
+            // Remove the last element (which now contains the removed entity ID)
             arrayEntitiesWithThisTag.pop();
-            delete arrayEntityToTag[entityId];
-            arrayTagToEntity.pop();
+
+            // Delete the entity ID mapping to the removed tag.
+            sparseMapEntityToTag.delete(entityId);
+
+            /**
+            * Delete the index last tag mapping to the respective entity ID because other swapped tag mapping
+            * (at the index of removed tag) has been updated to correctly map to the index of last tag.
+            */
+            sparseMapTagToEntity.delete(lastIndexTag);
+
+            // Fire a callback for an added tag if it exists.
+            onTagRemovedEventForEntities.get(entityHandle)?.(tag);
 
             return true;
+        }
+    }
+
+    /**
+     * Events
+     *
+     * Public API to register per-entity lifecycle callbacks for component and tag
+     * operations. Each setter attaches a listener function keyed by the entity
+     * handle tuple `[entityId, generation]` and will be invoked synchronously
+     * by the corresponding `Component`/`Tag` operation when it occurs.
+     *
+     * Available listeners:
+     * - `setComponentAddedForEntitySignalCallback(entityHandle, callback)` — called
+     *   when a component is added to the given entity.
+     * - `setComponentRemovedForEntitySignalCallback(entityHandle, callback)` — called
+     *   when a component is removed from the given entity.
+     * - `setComponentChangedForEntitySignalCallback(entityHandle, callback)` — called
+     *   when a component's data is mutably changed via `Component.mutablyChange`.
+     * - `setTagAddedForEntitySignalCallback(entityHandle, callback)` — called
+     *   when a tag is added to the given entity.
+     * - `setTagRemovedForEntitySignalCallback(entityHandle, callback)` — called
+     *   when a tag is removed from the given entity.
+     *
+     * Notes:
+     * - Callbacks are stored in internal Maps and are not automatically removed
+     * - Callback invocation is synchronous and happens inside the operation that
+     *   triggered the event.
+     */
+    export namespace Events {
+        /**
+            * Register a callback invoked when a component is added to the specified entity.
+            *
+            * @param entityHandle - Entity handle to attach the listener to.
+            * @param callback - Function called with the component type that was added.
+            */
+        export function setComponentAddedForEntitySignalCallback(entityHandle: EntityHandle, callback: (addedComponent: StrictComponent<unknown>) => void) {
+            onComponentAddedEventForEntities.set(entityHandle, callback);
+        }
+
+        /**
+            * Register a callback invoked when a component is removed from the specified entity.
+            *
+            * @param entityHandle - Entity handle to attach the listener to.
+            * @param callback - Function called with the component type that was removed.
+            */
+        export function setComponentRemovedForEntitySignalCallback(entityHandle: EntityHandle, callback: (removedComponent: StrictComponent<unknown>) => void) {
+            onComponentRemovedEventForEntities.set(entityHandle, callback);
+        }
+
+        /**
+            * Register a callback invoked when a component's data is mutably changed on the specified entity.
+            *
+            * @param entityHandle - Entity handle to attach the listener to.
+            * @param callback - Function called with the component type and the changed data (payload depends on component).
+            */
+        export function setComponentChangedForEntitySignalCallback(entityHandle: EntityHandle, callback: (changedComponent: StrictComponent<unknown>, changedData: unknown) => void) {
+            onComponentChangedEventForEntities.set(entityHandle, callback);
+        }
+
+        /**
+            * Register a callback invoked when a tag is added to the specified entity.
+            *
+            * @param entityHandle - Entity handle to attach the listener to.
+            * @param callback - Function called with the tag that was added.
+            */
+        export function setTagAddedForEntitySignalCallback(entityHandle: EntityHandle, callback: (addedTag: StrictTag) => void) {
+            onTagAddedEventForEntities.set(entityHandle, callback);
+        }
+
+        /**
+            * Register a callback invoked when a tag is removed from the specified entity.
+            *
+            * @param entityHandle - Entity handle to attach the listener to.
+            * @param callback - Function called with the tag that was removed.
+            */
+        export function setTagRemovedForEntitySignalCallback(entityHandle: EntityHandle, callback: (removedTag: StrictTag) => void) {
+            onTagRemovedEventForEntities.set(entityHandle, callback);
         }
     }
 }
