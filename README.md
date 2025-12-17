@@ -695,10 +695,6 @@ rblx-ecs/
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
 
-## License
-
-[Your License Here]
-
 ## Credits
 
 Built with ❤️ for the Roblox-TS community.
