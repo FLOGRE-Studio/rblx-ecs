@@ -77,14 +77,14 @@ export namespace RblxECS {
      * Structure: Array<[DenseComponents, SparseEntityToIndex, DenseIndexToEntity]>
      * 
      * For each component type (indexed by StrictComponent<T> ID):
-     * - [0] DenseComponents: Array<object> - Tightly packed component instances
+     * - [0] DenseComponents: Array<Record<string, unknown>> - Tightly packed component instances
      * - [1] SparseEntityToIndex: Map<number, number> - Maps entityId → index in dense array
      * - [2] SparseIndexToEntity: Map<number, number> - Maps dense array index → entityId
      * 
      * The third array enables O(1) swap-and-pop by quickly finding which entity
      * owns the component being swapped from the end of the dense array.
      */
-    const components: Map<number, [Array<object>, Map<number, number>, Map<number, number>]> = new Map();
+    const components: Map<number, [Array<Record<string, unknown>>, Map<number, number>, Map<number, number>]> = new Map();
 
     /**
      * Tag storage registry organized by tag type ID.
@@ -309,7 +309,7 @@ export namespace RblxECS {
          * generic information about the component's data structure. This enables
          * compile-time type checking for all component operations.
          * 
-         * @template T - The component data structure (must extend object)
+         * @template T - The component data structure (must extend Record<string, unknown>)
          * @returns Unique numeric identifier branded with type T
          * 
          * @example
@@ -323,7 +323,7 @@ export namespace RblxECS {
          * // These are now type-safe - TypeScript knows their shapes
          * ```
          */
-        export function createStrictComponent<T extends object>(): StrictComponent<T> {
+        export function createStrictComponent<T extends Record<string, unknown>>(): StrictComponent<T> {
             // Pre-increment to start IDs at 1 (0 might be reserved or falsy)
             return (nextComponentId += 1) as StrictComponent<T>;
         }
@@ -349,7 +349,7 @@ export namespace RblxECS {
          * }
          * ```
          */
-        export function get<T extends object>(
+        export function get<T extends Record<string, unknown>>(
             entityHandle: EntityHandle,
             component: StrictComponent<T>
         ): Readonly<T> | undefined {
@@ -393,7 +393,7 @@ export namespace RblxECS {
          * The callback is invoked with the component data, allowing in-place mutations to occur.
          * This also invokes all callbacks listening for a changed component for the specific entity.
          * 
-         * @template T - The type of the component data, constrained to be an object type.
+         * @template T - The type of the component data, constrained to be an Record<string, unknown> type.
          * @param entityHandle - A handle referencing the entity whose component will be modified.
          * @param component - The component identifier to modify on the entity.
          * @param callback - A function invoked with the component data to perform mutations. Return value is unused.
@@ -404,7 +404,7 @@ export namespace RblxECS {
          * @throws Throws an error if the component does not exist in the ECS system.
          * @throws Throws an error if the specified entity does not have the requested component.
          */
-        export function mutablyChange<T extends object>(entityHandle: EntityHandle, component: StrictComponent<T>, callback: (data: T) => boolean): void {
+        export function mutablyChange<T extends Record<string, unknown>>(entityHandle: EntityHandle, component: StrictComponent<T>, callback: (data: T) => boolean): void {
             const [ entityId ] = entityHandle;
             if (!isEntityValid(entityHandle, generationsArray)) error(`Cannot mutably change a component data for the entity with the ID of ${entityId}. The entity itself is stale and outdated.`);
 
@@ -442,7 +442,7 @@ export namespace RblxECS {
          * RblxECS.Component.add(entity, Velocity, { dx: 1, dy: 0, dz: 0 });
          * ```
          */
-        export function add<T extends object>(
+        export function add<T extends Record<string, unknown>>(
             entityHandle: EntityHandle,
             componentType: StrictComponent<T>,
             strictComponent: T
@@ -461,7 +461,7 @@ export namespace RblxECS {
 
             if (componentEntry === undefined) {
                 // First time this component type is being used - initialize storage
-                const denseArraycomponents = new Array<object>();
+                const denseArraycomponents = new Array<Record<string, unknown>>();
                 const sparseArrayEntityToComponents = new Map<number, number>();
                 const denseArrayComponentsToEntity = new Map<number, number>();
 

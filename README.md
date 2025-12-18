@@ -216,7 +216,7 @@ RblxECS.Entity.destroyEntity(entity);
 Registers a new component type and returns a type-safe identifier.
 
 **Type Parameters:**
-- `T extends object` - The component data structure
+- `T extends Record<string, unknown>` - The component data structure
 
 **Returns:** `StrictComponent<T>` - A branded numeric type identifier
 
