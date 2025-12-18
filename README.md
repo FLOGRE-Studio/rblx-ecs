@@ -113,11 +113,13 @@ Components are typed data containers that attach to entities. Each component typ
 
 ```ts
 interface Health {
+    [k: string]: unknown // Index signature to satisify Record<string, unknown>.
     current: number;
     maximum: number;
 }
 
 interface Armor {
+    [k: string]: unknown // Index signature to satisify Record<string, unknown>.
     defense: number;
     durability: number;
 }
@@ -222,6 +224,7 @@ Registers a new component type and returns a type-safe identifier.
 
 ```ts
 interface Transform {
+    [k: string]: unknown // Index signature to satisify Record<string, unknown>.
     position: Vector3;
     rotation: CFrame;
     scale: Vector3;
@@ -373,10 +376,10 @@ Organize your components and tags in a centralized registry:
 import { RblxECS } from "@rbxts/rblx-ecs";
 
 // Component interfaces
-interface Position { x: number; y: number; z: number }
-interface Velocity { dx: number; dy: number; dz: number }
-interface Health { current: number; maximum: number }
-interface Damage { amount: number; type: string }
+interface Position { [k: string]: unknown; x: number; y: number; z: number }
+interface Velocity { [k: string]: unknown; dx: number; dy: number; dz: number }
+interface Health { [k: string]: unknown; current: number; maximum: number }
+interface Damage { [k: string]: unknown; amount: number; type: string }
 
 // Create the ECS registry
 export const ECS = {
